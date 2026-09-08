@@ -33,8 +33,11 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
     [ "$ACTIVE" = "true" ] && state_set "$SID" final_written_ctx "$CTX"
     publish "$F"
     if [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ "$(state_get "$SID" t3_scheduled)" != "1" ]; then
-      state_set "$SID" t3_scheduled 1; bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG"
-      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; T3 auto-clear scheduled (/clear then /handoff:resume once this turn ends)." '{systemMessage:$m}'
+      state_set "$SID" t3_scheduled 1; R="$(bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG" "$SID")"
+      case "$R" in
+        *scheduled*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; T3 auto-clear scheduled (/clear then /handoff:resume once this turn ends). ${R}" '{systemMessage:$m}';;
+        *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged. T3 auto-clear skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
+      esac
     else
       jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff for this session is written and staged. Type /clear, then /handoff:resume (the plugin does not clear by itself unless T3_AUTOCLEAR is on)." '{systemMessage:$m}'
     fi
