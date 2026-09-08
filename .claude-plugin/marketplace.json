@@ -1,0 +1,8 @@
+{
+  "name": "samz-tools",
+  "owner": { "name": "Sam Zilverberg", "email": "szilverberg@payzen.com" },
+  "metadata": { "description": "Sam's local Claude Code plugins" },
+  "plugins": [
+    { "name": "handoff", "source": "./plugins/handoff", "description": "End-of-turn context handoff → /clear → resume; auto-compact only as safeguard", "category": "productivity" }
+  ]
+}

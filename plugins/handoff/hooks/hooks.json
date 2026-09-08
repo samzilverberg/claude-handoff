@@ -1,0 +1,9 @@
+{
+  "description": "handoff: end-of-turn handoff at a context threshold, staging on /clear, auto-compact safeguard",
+  "hooks": {
+    "Stop":         [ { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/handoff-stop.sh\"", "timeout": 15 } ] } ],
+    "SessionEnd":   [ { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/handoff-sessionend.sh\"", "timeout": 600 } ] } ],
+    "SessionStart": [ { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/handoff-sessionstart.sh\"", "timeout": 10 } ] } ],
+    "PreCompact":   [ { "hooks": [ { "type": "command", "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/handoff-precompact.sh\"", "timeout": 600 } ] } ]
+  }
+}

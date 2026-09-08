@@ -1,0 +1,68 @@
+{
+  "name": "handoff",
+  "version": "0.3.6",
+  "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
+  "author": {
+    "name": "Sam Zilverberg",
+    "email": "szilverberg@payzen.com"
+  },
+  "keywords": [
+    "context",
+    "compaction",
+    "handoff",
+    "hooks"
+  ],
+  "userConfig": {
+    "THRESHOLD": {
+      "type": "number",
+      "title": "Handoff threshold (tokens)",
+      "description": "At the end of a turn whose context is at or above this, Claude writes the handoff and you are told to /clear. 0 = off.",
+      "default": 300000,
+      "min": 0
+    },
+    "LIVE_FROM": {
+      "type": "number",
+      "title": "Live state from (tokens)",
+      "description": "From this context size on, Claude keeps a running handoff file updated at the end of turns. 0 = off.",
+      "default": 0,
+      "min": 0
+    },
+    "LIVE_EVERY": {
+      "type": "number",
+      "title": "Live state interval (tokens)",
+      "description": "Re-update the running handoff only after the context grew by this many tokens.",
+      "default": 20000,
+      "min": 1000
+    },
+    "MODE": {
+      "type": "string",
+      "title": "Auto-compact safeguard mode",
+      "description": "inject: let auto-compact run after staging a handoff. block: refuse proactive auto-compact and ask for /clear.",
+      "default": "inject"
+    },
+    "MODEL": {
+      "type": "string",
+      "title": "Summarizer model",
+      "description": "Model for the nested claude -p that writes a handoff from the transcript when Claude did not write one itself.",
+      "default": "claude-opus-4-8"
+    },
+    "EFFORT": {
+      "type": "string",
+      "title": "Summarizer effort",
+      "description": "Effort level for the summarizer.",
+      "default": "medium"
+    },
+    "STARTUP": {
+      "type": "string",
+      "title": "Fresh-startup behaviour",
+      "description": "ignore: a new session told to ignore another session's staged handoff. adopt: use it.",
+      "default": "ignore"
+    },
+    "T3_AUTOCLEAR": {
+      "type": "boolean",
+      "title": "T3 Code auto-clear (experimental)",
+      "description": "When the handoff is staged inside a T3 Code thread, wait for the turn to end, then send /clear and /handoff:resume to that thread via t3ctl.",
+      "default": false
+    }
+  }
+}
