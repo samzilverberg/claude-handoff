@@ -4,7 +4,7 @@
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
-    "email": "szilverberg@payzen.com"
+    "url": "https://github.com/samzilverberg"
   },
   "keywords": [
     "context",
@@ -64,5 +64,8 @@
       "description": "When the handoff is staged inside a T3 Code thread, wait for the turn to end, then send /clear and /handoff:resume to that thread via t3ctl.",
       "default": false
     }
-  }
+  },
+  "homepage": "https://github.com/samzilverberg/claude-handoff",
+  "repository": "https://github.com/samzilverberg/claude-handoff",
+  "license": "MIT"
 }

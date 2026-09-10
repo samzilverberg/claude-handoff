@@ -1,7 +1,7 @@
 {
-  "name": "samz-tools",
-  "owner": { "name": "Sam Zilverberg", "email": "szilverberg@payzen.com" },
-  "metadata": { "description": "Sam's local Claude Code plugins" },
+  "name": "claude-handoff",
+  "owner": { "name": "Sam Zilverberg", "url": "https://github.com/samzilverberg" },
+  "metadata": { "description": "Claude Code plugin: end-of-turn context handoff → /clear → resume, instead of mid-turn auto-compact" },
   "plugins": [
     { "name": "handoff", "source": "./plugins/handoff", "description": "End-of-turn context handoff → /clear → resume; auto-compact only as safeguard", "category": "productivity" }
   ]

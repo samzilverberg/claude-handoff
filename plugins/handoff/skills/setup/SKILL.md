@@ -22,4 +22,4 @@ note says this section belongs to another session, ignore it.
 
 Without `--import`, the handoff is loaded on demand with `/handoff:resume` instead (recommended when several sessions share this directory).
 
-4. Report what you changed and remind the user: set the threshold via `/plugin manage` → handoff, or `HANDOFF_THRESHOLD` in the `env` block of settings.json; set `/autocompact 450k` (or `autoCompactWindow`) about 100k above the threshold.
+4. Report what you changed and remind the user: set the threshold via `/plugin manage` → handoff, or `HANDOFF_THRESHOLD` in the `env` block of settings.json; set `/autocompact 400k` (or `"autoCompactWindow": 400000` in settings.json) about 100k above the threshold.

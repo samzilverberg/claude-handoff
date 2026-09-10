@@ -3,7 +3,7 @@
 Auto-compact fires mid-turn and its summary drops decisions. This plugin instead acts **at the end of the turn**
 that crosses a context threshold: Claude writes a structured handoff document itself, the plugin stages it,
 **you type `/clear`** (the plugin never clears by itself unless `T3_AUTOCLEAR` is on), and the fresh context resumes from it via `/handoff:resume`. Running `/handoff:resume` without `/clear` just adds the document on top of the full context. Auto-compact stays on only as a safeguard far above the
-threshold. Verified against Claude Code 2.1.263 with driven sessions (logs in `~/tmp/handoff-poc*/`).
+threshold. Verified against Claude Code 2.1.263 with 18 driven test sessions plus real long sessions.
 
 ```
 turn ends ─Stop hook─▶ ctx ≥ THRESHOLD?  (never mid-turn)
@@ -19,18 +19,24 @@ optional LIVE_FROM ─▶ from that size on, Claude keeps the same file updated 
 safeguard: auto-compact window ≈ THRESHOLD + 100k; PreCompact stages a handoff if it fires anyway
 ```
 
-## Install (local marketplace; this repo is the marketplace)
+## Requirements
+
+* macOS (the hooks use BSD `stat`/`ps`; they disable themselves with a notice on other OSes)
+* Claude Code ≥ 2.1.263, `bash`, `jq`
+* Optional, only for `T3_AUTOCLEAR`: [T3 Code](https://t3.chat/code) with [`t3ctl`](https://github.com/samzilverberg/t3ctl) on PATH, and `sqlite3` (ships with macOS)
+
+## Install
 
 ```
-claude plugin marketplace add ~/dev/claude-handoff
-claude plugin install handoff@samz-tools -s user
-claude plugin install handoff@samz-tools -s user --config THRESHOLD=300000 --config LIVE_FROM=0   # or /plugin configure handoff@samz-tools in a session
-/autocompact 400k                              # safeguard ~100k above the threshold; persistent: "autoCompactWindow": 400000 in ~/.claude/settings.json (T3: "Auto-compact after")
+claude plugin marketplace add samzilverberg/claude-handoff
+claude plugin install handoff@claude-handoff -s user
+claude plugin install handoff@claude-handoff -s user --config THRESHOLD=300000 --config LIVE_FROM=0   # or /plugin configure handoff@claude-handoff in a session
+/autocompact 400k                              # safeguard ~100k above the threshold; persistent: "autoCompactWindow": 400000 in ~/.claude/settings.json (T3 Code: "Auto-compact after")
 ```
 
-Already done on this machine (2026-09-08). Iterate: edit under `plugins/handoff/`, bump `version` in
-`plugin.json`, `claude plugin update handoff@samz-tools` (or `claude plugin marketplace update samz-tools`).
-For a quick try without installing: `claude --plugin-dir ~/dev/claude-handoff/plugins/handoff`.
+From a local clone instead: `claude plugin marketplace add /path/to/claude-handoff`. Quick try without installing:
+`claude --plugin-dir /path/to/claude-handoff/plugins/handoff`. Upgrade: `claude plugin marketplace update claude-handoff`
+then `claude plugin update handoff@claude-handoff`, and restart the session.
 
 Per project (optional): `/handoff:setup` creates `.claude/handoff/` and gitignores it; `/handoff:setup --import`
 also adds a CLAUDE.md `@.claude/handoff/current.md` import so the handoff loads with zero keystrokes after
@@ -38,7 +44,7 @@ also adds a CLAUDE.md `@.claude/handoff/current.md` import so the handoff loads 
 
 ## Configuration
 
-Precedence: `HANDOFF_<KEY>` env var (session override) > plugin userConfig (`/plugin configure handoff@samz-tools`,
+Precedence: `HANDOFF_<KEY>` env var (session override) > plugin userConfig (`/plugin configure handoff@claude-handoff`,
 exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 
 | Key | Default | Meaning |
@@ -95,6 +101,22 @@ Stop says: Handoff: context is 363900 tokens (limit 350000). Handoff for this se
 
 Plugins cannot ship CLAUDE.md content, which is why the import needs `/handoff:setup --import` per project.
 
+## T3 Code: zero-keystroke handoff (`T3_AUTOCLEAR`)
+
+[T3 Code](https://t3.chat/code) runs Claude Code as a stream-json child and its composer forwards slash commands, so
+a `/clear` sent to the thread reaches Claude Code. With `T3_AUTOCLEAR=true` the Stop hook, after staging the handoff,
+hands off to `scripts/t3-autoclear.sh`, which uses [`t3ctl`](https://github.com/samzilverberg/t3ctl) (a CLI for an
+already-running T3 Code app: `threads list/wait/send`) to wait for the turn to end, send `/clear`, then `/handoff:resume`.
+Nothing to type; the thread continues in a fresh context.
+
+Setup: install `t3ctl` per its README (`pnpm install && pnpm link --global`), then `/plugin configure handoff@claude-handoff`
+→ `T3_AUTOCLEAR=true`, and set "Auto-compact after" in T3 Code's Claude settings ~100k above `THRESHOLD`.
+
+Safety: the helper only acts when the Claude process was spawned by T3 Code, resolves the thread by this session's
+exact Claude session id (from T3's local state db), and re-checks that mapping right before sending `/clear`. Any
+miss is logged and reported in the Stop message, and the manual path applies. Sessions started from the Claude CLI,
+the desktop app or other wrappers are never touched; they always get the manual `/clear` + `/handoff:resume` prompt.
+
 ## Verified facts (hooks reference + 18 driven sessions)
 
 | Fact | Evidence |
@@ -136,4 +158,7 @@ optional live state, but gated by context size and growth instead of every promp
 * Blocking auto-compact after the API already returned a context-limit error fails that request. Keep the window ≥ 100k above the threshold.
 * `T3_AUTOCLEAR` was verified once (sonnet 4.6, local-env thread, threshold 30k via a project `settings.local.json` env override): helper log shows `autoclear scheduled` → `sent /clear` → `sent /handoff:resume`, and the hooks log shows `SessionEnd(clear)`/`SessionStart(clear)` on the same pid. v0.3.7 guards (host + exact session id) dry-run tested from a live T3 worktree thread; other hosts (Claude CLI, Cowork, Superset) have no known API to inject `/clear`, so they keep the manual `/clear` + `/handoff:resume` path. Superset sessions are detectable via `SUPERSET_TAB_ID` if an adapter is ever wanted.
 * `t3ctl` JSON output can contain raw control characters that break `jq`; the helper strips them. When scripting `t3ctl threads new`, never pass an empty thread ref to `threads send`: it resolves to some other thread.
-* Your `~/.claude/settings.json` still lists 7 `cavemem` hooks pointing at a node 22.21.1 path that no longer exists; every event logs a hook failure. Remove them or reinstall cavemem.
+
+## License
+
+MIT. Issues and PRs welcome at https://github.com/samzilverberg/claude-handoff.
