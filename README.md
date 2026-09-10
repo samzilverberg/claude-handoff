@@ -23,7 +23,7 @@ safeguard: auto-compact window ≈ THRESHOLD + 100k; PreCompact stages a handoff
 
 * macOS (the hooks use BSD `stat`/`ps`; they disable themselves with a notice on other OSes)
 * Claude Code ≥ 2.1.263, `bash`, `jq`
-* Optional, only for `T3_AUTOCLEAR`: [T3 Code](https://t3.chat/code) with [`t3ctl`](https://github.com/samzilverberg/t3ctl) on PATH, and `sqlite3` (ships with macOS)
+* Optional, only for `T3_AUTOCLEAR`: [T3 Code](https://github.com/pingdotgg/t3code) with [`t3ctl`](https://github.com/samzilverberg/t3ctl) on PATH, and `sqlite3` (ships with macOS)
 
 ## Install
 
@@ -103,7 +103,7 @@ Plugins cannot ship CLAUDE.md content, which is why the import needs `/handoff:s
 
 ## T3 Code: zero-keystroke handoff (`T3_AUTOCLEAR`)
 
-[T3 Code](https://t3.chat/code) runs Claude Code as a stream-json child and its composer forwards slash commands, so
+[T3 Code](https://github.com/pingdotgg/t3code) runs Claude Code as a stream-json child and its composer forwards slash commands, so
 a `/clear` sent to the thread reaches Claude Code. With `T3_AUTOCLEAR=true` the Stop hook, after staging the handoff,
 hands off to `scripts/t3-autoclear.sh`, which uses [`t3ctl`](https://github.com/samzilverberg/t3ctl) (a CLI for an
 already-running T3 Code app: `threads list/wait/send`) to wait for the turn to end, send `/clear`, then `/handoff:resume`.
