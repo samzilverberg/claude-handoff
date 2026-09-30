@@ -5,6 +5,17 @@ source "$(dirname "$0")/handoff-lib.sh"
 IN="$(cat)"
 SRC="$(jq -r .source <<<"$IN")"; SID="$(jq -r .session_id <<<"$IN")"
 log sessionstart "source=$SRC sid=$SID pid=$CPID owner=$(owner_pid)"
+
+# Zombie guard: any resume/compact/startup of a session that was already /cleared (tombstoned) is a
+# resurrected pre-clear session (e.g. a T3 host resume cursor that never advanced to the new session).
+# Tell the model to stop before it re-runs the work; its Stop/PreCompact hooks are inert too.
+if [ "$SRC" != "clear" ] && is_tombstoned "$SID"; then
+  CB="$(tombstone_get "$SID" continued_by)"; WHEN="$(tombstone_get "$SID" cleared_at)"
+  log sessionstart "TOMBSTONED sid=$SID (cleared_at=$WHEN continued_by=${CB:-?}); injecting stop"
+  echo "STOP — stale session resume. This session ($SID) was handed off and /cleared${WHEN:+ at $WHEN}${CB:+, and its work continues in session $CB}. This is a leftover resume of an already-superseded session (typically the T3 host resuming the pre-/clear session id after an in-process /clear). Do NOT continue the task, edit files, run tools, or write a handoff — doing so duplicates work the successor session already did. Tell the user this thread was resumed onto a stale, superseded session and stop."
+  exit 0
+fi
+
 case "$SRC" in
   clear|compact)
     MINE="$HANDOFF_DIR/by-pid/$CPID.md"
@@ -13,6 +24,14 @@ case "$SRC" in
       # Without the CLAUDE.md import, the handoff is loaded on demand: tell Claude it exists.
       if ! grep -qs '@.claude/handoff/current.md' "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md" 2>/dev/null; then
         echo "A handoff document from the previous context window of this conversation is staged (written at the user's request before the context was cleared). Before doing anything else, invoke the handoff:resume skill to load it, then continue from its Next steps."
+      fi
+    fi
+    # Link the just-cleared session (same pid) to this successor, for the zombie-stop note above.
+    if [ "$SRC" = "clear" ]; then
+      B="$HANDOFF_DIR/state/pid-cleared/$CPID"
+      if [ -f "$B" ]; then
+        OLD="$(cat "$B" 2>/dev/null)"; [ -n "$OLD" ] && [ "$OLD" != "$SID" ] && tombstone_link "$OLD" "$SID"
+        rm -f "$B"
       fi
     fi ;;
   startup|fork|resume)

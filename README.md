@@ -150,6 +150,28 @@ the desktop app or other wrappers are never touched; they always get the manual 
 Borrowed from thepushkarp: the section-completeness check with a bounded retry. Borrowed from Sonovore: the
 optional live state, but gated by context size and growth instead of every prompt.
 
+## Stale-session guard (duplicate-run protection)
+
+An in-process `/clear` mints a **new** session id, but a host may keep its resume cursor on the
+**old** (pre-`/clear`) id. Observed under T3 Code: after `/clear` (`SessionEnd(clear) <old>` →
+`SessionStart(clear) <new>`, same pid), the thread was later respawned as `claude --resume <old>` in
+a fresh process — a **zombie** carrying the full pre-`/clear` context that re-ran the task and
+re-published the stale handoff, duplicating file edits, a scheduled job, and helper threads.
+
+Guard: `SessionEnd(clear)` **tombstones** the cleared session id (`state/tombstones/<sid>.json`) and
+`SessionStart(clear)` links the successor. Any later `resume`/`compact`/`startup` of a tombstoned id
+is a zombie: `SessionStart` tells the model to stop (it was superseded by session X), and the `Stop`
+and `PreCompact` hooks go **inert** so it can never re-stage stale content. A normal, never-cleared
+`--resume` is unaffected (only `/clear`ed ids are tombstoned).
+
+Residual: the guard makes the zombie *harmless* but cannot stop the host from spawning it — the model
+is only *asked* to stop, and it can still act before/against the note. The true fix is advancing the
+host's resume cursor to the new id on `/clear`; T3 exposes **no** API for that today (`t3ctl` writes
+only whitelisted WS commands, none of which sets a thread's resume cursor / provider session id, and
+`thread.session.stop` kills the session without clearing the cursor), so it would need an upstream T3
+command first. Two concurrent `--resume` of the *same* never-cleared id (a separate host duplicate-spawn
+bug) is also out of scope. Tests: `plugins/handoff/tests/tombstone_test.sh`.
+
 ## Caveats
 
 * macOS only for now: `handoff-lib.sh` guards on `uname -s` = Darwin and disables every hook (with a one-line system message) elsewhere. Linux would need `stat -f %m` → `stat -c %Y` and a check of `ps -o command=`.

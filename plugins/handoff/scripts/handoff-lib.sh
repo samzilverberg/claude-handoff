@@ -13,7 +13,7 @@ HANDOFF_DIR="$ROOT/.claude/handoff"
 CURRENT="$HANDOFF_DIR/current.md"          # the file CLAUDE.md @imports
 OWNER="$HANDOFF_DIR/current.owner"         # pid of the claude process whose handoff is in current.md
 LOG="$HANDOFF_DIR/hooks.log"
-mkdir -p "$HANDOFF_DIR/sessions" "$HANDOFF_DIR/by-pid" "$HANDOFF_DIR/state"
+mkdir -p "$HANDOFF_DIR/sessions" "$HANDOFF_DIR/by-pid" "$HANDOFF_DIR/state" "$HANDOFF_DIR/state/tombstones" "$HANDOFF_DIR/state/pid-cleared"
 # cfg KEY default -> env HANDOFF_KEY (session override) > plugin userConfig (CLAUDE_PLUGIN_OPTION_KEY) > default
 cfg() { local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"; [ -n "$v" ] || v="$(printenv "CLAUDE_PLUGIN_OPTION_$k" 2>/dev/null)"; printf '%s' "${v:-$d}"; }
 # state get/set per session (tiny json)
@@ -28,10 +28,14 @@ mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
 age() { echo $(( $(now) - $(mtime "$1") )); }
 
 # pid of the claude process that spawned this hook (hooks are spawned directly: $PPID). Walk up as a fallback.
+# Match the *executable* (first token, basename == claude), not any command line containing the
+# substring "claude": a plain *claude* match also hits ".claude/…" paths (snapshot/plugin-cache
+# shells), which would return an intermediate shell's pid instead of the real Claude process.
 claude_pid() {
-  local p=$PPID i=0
+  local p=$PPID i=0 cmd exe
   while [ $i -lt 4 ] && [ "$p" -gt 1 ]; do
-    case "$(ps -o command= -p "$p" 2>/dev/null)" in *claude*) echo "$p"; return;; esac
+    cmd="$(ps -o command= -p "$p" 2>/dev/null)"; exe="${cmd%% *}"
+    case "${exe##*/}" in claude) echo "$p"; return;; esac
     p=$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' '); i=$((i+1))
   done
   echo "$PPID"
@@ -105,4 +109,31 @@ session_handoff() {
   local f="$HANDOFF_DIR/sessions/$2.md" max="${4:-$(cfg FRESH_SEC 900)}"
   if [ -s "$f" ] && [ "$(age "$f")" -lt "$max" ]; then echo "$f"; return 0; fi
   generate_handoff "$1" "$2" "$3" && echo "$f"
+}
+
+# --- session tombstones (supersession guard) --------------------------------
+# Root cause of the duplicate-run bug: an in-process /clear mints a NEW session id, but the T3
+# Code host keeps its resume cursor on the OLD (pre-clear) id, so it later respawns
+# `claude --resume <OLD>` — a "zombie" that carries the full pre-clear context, re-runs the task,
+# and re-publishes the stale handoff, duplicating edits/jobs/threads. (Confirmed in hooks.log:
+# sessionend reason=clear <OLD> -> sessionstart source=clear <NEW> -> hours later
+# sessionstart source=resume <OLD> in a new pid, then repeated [publish] of <OLD>'s handoff.)
+# A tombstone records that <OLD> was cleared/superseded so the zombie's hooks go inert and its
+# SessionStart tells the model to stop. The claim-marker on the handoff (an earlier attempt)
+# could not help: the zombie never goes through /handoff:resume.
+tombstone_file() { echo "$HANDOFF_DIR/state/tombstones/$1.json"; }
+is_tombstoned()  { [ -f "$(tombstone_file "$1")" ]; }
+tombstone_get()  { local f; f="$(tombstone_file "$1")"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null || true; }
+# tombstone_set <sid> <cleared_by_pid> : mark <sid> as cleared/superseded (idempotent).
+tombstone_set() {
+  mkdir -p "$HANDOFF_DIR/state/tombstones"
+  jq -nc --arg pid "$2" --arg at "$(date -Iseconds)" --argjson ts "$(now)" \
+    '{cleared_by_pid:$pid, cleared_at:$at, cleared_ts:$ts}' > "$(tombstone_file "$1")"
+  log tombstone "set sid=$1 by pid=$2"
+}
+# tombstone_link <sid> <continued_by_sid> : record the successor session (best-effort note only).
+tombstone_link() {
+  local f cur; f="$(tombstone_file "$1")"; [ -f "$f" ] || return 0
+  cur="$(cat "$f")"; jq -c --arg n "$2" '.continued_by=$n' <<<"$cur" > "$f"
+  log tombstone "link sid=$1 -> $2"
 }

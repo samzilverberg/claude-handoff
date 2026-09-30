@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",

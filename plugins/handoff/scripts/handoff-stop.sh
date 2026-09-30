@@ -12,6 +12,9 @@ CTX="$(context_tokens "$T")"; CTX="${CTX:-0}"
 THR="$(cfg THRESHOLD 300000)"; LIVE_FROM="$(cfg LIVE_FROM 0)"; LIVE_EVERY="$(cfg LIVE_EVERY 20000)"
 F="$HANDOFF_DIR/sessions/$SID.md"
 log stop "ctx=$CTX thr=$THR live_from=$LIVE_FROM active=$ACTIVE sid=$SID"
+# A tombstoned session was already /cleared and superseded; a resume of it is a stale zombie.
+# Do not publish (would re-stage stale content) or nudge — stay inert.
+if is_tombstoned "$SID"; then log stop "tombstoned sid=$SID; inert (no publish/nudge)"; exit 0; fi
 
 SECTIONS='Sections, in this order: # Handoff; ## Goal (the user'"'"'s actual ask, their words where possible); ## Standing instructions from the user (EVERY steering directive the user gave in this conversation, in order, near-verbatim, one bullet each: scope limits, "do not X", "always Y", style/format preferences, process rules, corrections of your behaviour. Tag each [active] or [superseded by #n] or [withdrawn], and name its source: which user message (quote a few words), CLAUDE.md, or a hook note; do not attribute a chat instruction to CLAUDE.md. Never drop an entry because it was later changed; the successor must see the history); ## Decisions log (each significant decision: what, who decided (user/assistant), why, and [active] or [reversed by #n]); ## Current state (done + how verified); ## In progress (exact step when context ended); ## Next steps (ordered, actionable); ## Key files & symbols (path:line, one-line role); ## Gotchas / dead ends (tried and rejected, why); ## Open questions for the user. Before writing, re-read the user'"'"'s messages in this conversation and make sure every directive appears under Standing instructions. Be concrete: paths, symbols, commands, exact decisions. No placeholders.'
 

@@ -6,6 +6,8 @@ source "$(dirname "$0")/handoff-lib.sh"
 IN="$(cat)"
 T="$(jq -r .transcript_path <<<"$IN")"; SID="$(jq -r .session_id <<<"$IN")"; TRIG="$(jq -r .trigger <<<"$IN")"
 log precompact "trigger=$TRIG sid=$SID ctx=$(context_tokens "$T")"
+# Stale zombie (tombstoned = already /cleared and superseded): do not (re)stage its handoff.
+if is_tombstoned "$SID"; then log precompact "tombstoned sid=$SID; inert (no publish)"; exit 0; fi
 F="$(session_handoff "$T" "$SID" "precompact-$TRIG")" && publish "$F"
 if [ "$(cfg MODE inject)" = "block" ] && [ "$TRIG" = "auto" ]; then
   jq -nc '{decision:"block", reason:"Handoff staged in .claude/handoff/current.md. Auto-compact blocked; type /clear to continue from the handoff."}'
