@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.3.8",
+  "version": "0.4.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -61,8 +61,14 @@
     "T3_AUTOCLEAR": {
       "type": "boolean",
       "title": "T3 Code auto-clear (experimental)",
-      "description": "When the handoff is staged inside a T3 Code thread, wait for the turn to end, then send /clear and /handoff:resume to that thread via t3ctl.",
+      "description": "Inside a T3 Code thread: deliver the handoff-writing request as its own turn (so the reply you were reading stays visible in T3's timeline), then once the handoff is staged send /clear and /handoff:resume to that thread via t3ctl.",
       "default": false
+    },
+    "T3_NUDGE_TURN": {
+      "type": "boolean",
+      "title": "T3: handoff request as its own turn",
+      "description": "With T3_AUTOCLEAR: true sends the handoff-writing request to the thread as a separate turn (keeps the previous reply visible). false uses the in-turn Stop nudge as before; auto-clear still runs.",
+      "default": true
     }
   },
   "homepage": "https://github.com/samzilverberg/claude-handoff",

@@ -55,7 +55,10 @@ exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 | `MODE` | inject | PreCompact safeguard: `inject` stages a handoff and lets compaction run; `block` refuses proactive auto-compact and asks for `/clear` |
 | `MODEL` / `EFFORT` | claude-opus-4-8 / medium | Nested `claude -p` summarizer, used only when Claude did not write the handoff itself |
 | `STARTUP` | ignore | Fresh startup that finds another live session's staged handoff: `ignore` (inject a "not yours" note) or `adopt` |
-| `T3_AUTOCLEAR` | false | Inside a T3 Code thread only: after staging, a detached helper waits for the turn to end, then sends `/clear` and `/handoff:resume` to **this session's** thread via `t3ctl`. Guards: (1) host must be T3 Code (`__CFBundleIdentifier=com.t3tools.t3code` or a "T3 Code" ancestor process), so CLI / Cowork / Superset sessions never touch a thread; (2) thread resolved by exact Claude session id from `~/.t3/userdata/state.sqlite` (`provider_session_runtime.resume_cursor_json.resume`, read-only), directory match only as a fallback when the db is unreadable and only if unambiguous; (3) re-checked right before `/clear`. Skips are logged and shown in the Stop message. `HANDOFF_T3_DRYRUN=1` resolves without sending |
+| `T3_AUTOCLEAR` | false | Inside a T3 Code thread only. The handoff-writing request is sent to the thread as **its own turn** (not in-turn via `additionalContext`), so the reply you were reading stays the turn's visible message; after staging, the same detached helper waits for the turn to end, then sends `/clear` and `/handoff:resume` to **this session's** thread via `t3ctl`. A send that fails because the thread is busy is retried after the next idle for up to `T3_SEND_TIMEOUT` s (default 600). Guards: (1) host must be T3 Code (`__CFBundleIdentifier=com.t3tools.t3code` or a "T3 Code" ancestor process), so CLI / Cowork / Superset sessions never touch a thread; (2) thread resolved by exact Claude session id from `~/.t3/userdata/state.sqlite` (`provider_session_runtime.resume_cursor_json.resume`, read-only), directory match only as a fallback when the db is unreadable and only if unambiguous; (3) re-checked right before `/clear`. Skips are logged and shown in the Stop message. `HANDOFF_T3_DRYRUN=1` resolves without sending |
+
+| `T3_NUDGE_TURN` | true | With `T3_AUTOCLEAR`: `true` sends the handoff-writing request as its own turn (see the T3 section); `false` uses the in-turn Stop nudge as before, auto-clear still runs. Flip it to compare while testing |
+| `T3_SEND_TIMEOUT` | 600 | Seconds the T3 helper keeps retrying a send that failed because the thread was busy |
 
 Skills: `/handoff:resume [extra instructions]`, `/handoff:status`, `/handoff:setup [--import]`.
 
@@ -111,6 +114,25 @@ Nothing to type; the thread continues in a fresh context.
 
 Setup: install `t3ctl` per its README (`pnpm install && pnpm link --global`), then `/plugin configure handoff@claude-handoff`
 → `T3_AUTOCLEAR=true`, and set "Auto-compact after" in T3 Code's Claude settings ~100k above `THRESHOLD`.
+
+Why the handoff request is a separate turn under T3: T3's timeline shows only the **last** assistant message of a
+completed turn and folds everything before it behind a "Worked for …" row. An in-turn nudge (Stop `additionalContext`)
+makes Claude write the file and then emit a "handoff written" note, which becomes that last message, so the real reply
+you were waiting for disappears into the fold (and the note tends to be a compressed restatement of it). With
+`T3_AUTOCLEAR` the Stop hook therefore has the helper send the request as a new user turn (`[handoff plugin] …`) once
+the thread is idle; the reply keeps its turn, the handoff turn ends with "Handoff written", and the next Stop stages it
+and schedules `/clear` + `/handoff:resume`. The same applies to the refresh and live-mode nudges. Whenever the helper
+cannot act (not a T3 host, session not found, `t3ctl` missing), the hook falls back to the in-turn nudge and says why.
+
+```
+… turn ends at 362k …
+Stop says: Handoff: context is 362104 tokens (limit 350000). Asking Claude to write the handoff document before it stops. Delivered as a separate T3 turn so this reply stays visible. nudge scheduled for thread <id> …
+> [handoff plugin] The context window is at 362104 tokens … Write the handoff document …      (sent by the helper)
+Claude: [Write .claude/handoff/sessions/<sid>.md] Handoff written.
+Stop says: Handoff: context is 363900 tokens (limit 350000). Handoff staged; T3 auto-clear scheduled (/clear then /handoff:resume once this turn ends). clear scheduled for thread <id> …
+> /clear
+> /handoff:resume
+```
 
 Safety: the helper only acts when the Claude process was spawned by T3 Code, resolves the thread by this session's
 exact Claude session id (from T3's local state db), and re-checks that mapping right before sending `/clear`. Any
@@ -178,7 +200,7 @@ bug) is also out of scope. Tests: `plugins/handoff/tests/tombstone_test.sh`.
 * Tests used sonnet-5 at low effort with tiny thresholds; behaviour at 300k with opus/fable should be better, not worse.
 * At Stop time the transcript lags by one assistant message, so the hook measures the context as of the previous model call (max over the last 3 usages). At 300k that is one tool call behind; a single huge read right before the turn ends is caught at the next turn end, or by the auto-compact safeguard.
 * Blocking auto-compact after the API already returned a context-limit error fails that request. Keep the window ≥ 100k above the threshold.
-* `T3_AUTOCLEAR` was verified once (sonnet 4.6, local-env thread, threshold 30k via a project `settings.local.json` env override): helper log shows `autoclear scheduled` → `sent /clear` → `sent /handoff:resume`, and the hooks log shows `SessionEnd(clear)`/`SessionStart(clear)` on the same pid. v0.3.7 guards (host + exact session id) dry-run tested from a live T3 worktree thread; other hosts (Claude CLI, Cowork, Superset) have no known API to inject `/clear`, so they keep the manual `/clear` + `/handoff:resume` path. Superset sessions are detectable via `SUPERSET_TAB_ID` if an adapter is ever wanted.
+* `T3_AUTOCLEAR` was verified once (sonnet 4.6, local-env thread, threshold 30k via a project `settings.local.json` env override): helper log shows `autoclear scheduled` → `sent /clear` → `sent /handoff:resume`, and the hooks log shows `SessionEnd(clear)`/`SessionStart(clear)` on the same pid. v0.3.7 guards (host + exact session id) dry-run tested from a live T3 worktree thread. v0.4.0's separate-turn nudge and busy retry are covered by `plugins/handoff/tests/t3_nudge_test.sh` (fake `t3ctl` + sqlite) and the fold behaviour was read from T3's client bundle, but the full nudge → write → clear → resume loop has not yet been driven on a live T3 thread; other hosts (Claude CLI, Cowork, Superset) have no known API to inject `/clear`, so they keep the manual `/clear` + `/handoff:resume` path. Superset sessions are detectable via `SUPERSET_TAB_ID` if an adapter is ever wanted.
 * `t3ctl` JSON output can contain raw control characters that break `jq`; the helper strips them. When scripting `t3ctl threads new`, never pass an empty thread ref to `threads send`: it resolves to some other thread.
 
 ## License

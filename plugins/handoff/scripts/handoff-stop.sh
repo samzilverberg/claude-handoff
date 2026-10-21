@@ -18,6 +18,28 @@ if is_tombstoned "$SID"; then log stop "tombstoned sid=$SID; inert (no publish/n
 
 SECTIONS='Sections, in this order: # Handoff; ## Goal (the user'"'"'s actual ask, their words where possible); ## Standing instructions from the user (EVERY steering directive the user gave in this conversation, in order, near-verbatim, one bullet each: scope limits, "do not X", "always Y", style/format preferences, process rules, corrections of your behaviour. Tag each [active] or [superseded by #n] or [withdrawn], and name its source: which user message (quote a few words), CLAUDE.md, or a hook note; do not attribute a chat instruction to CLAUDE.md. Never drop an entry because it was later changed; the successor must see the history); ## Decisions log (each significant decision: what, who decided (user/assistant), why, and [active] or [reversed by #n]); ## Current state (done + how verified); ## In progress (exact step when context ended); ## Next steps (ordered, actionable); ## Key files & symbols (path:line, one-line role); ## Gotchas / dead ends (tried and rejected, why); ## Open questions for the user. Before writing, re-read the user'"'"'s messages in this conversation and make sure every directive appears under Standing instructions. Be concrete: paths, symbols, commands, exact decisions. No placeholders.'
 
+# Nudges are normally delivered in-turn (Stop additionalContext). Under T3 Code with T3_AUTOCLEAR that makes the
+# "handoff written" note the turn's last assistant message, and T3's timeline shows only that one, folding the real
+# reply behind "Worked for …". So in T3 mode the nudge goes out as its own turn via t3-autoclear.sh nudge instead.
+# T3_NUDGE_TURN=false switches back to the in-turn nudge (auto-clear itself unaffected), e.g. to compare while testing.
+# t3_nudge <text>: returns 0 when the helper scheduled it (then do NOT emit additionalContext); R holds its report.
+t3_nudge() {
+  R=""; [ "$(cfg T3_AUTOCLEAR false)" = "true" ] || return 1
+  [ "$(cfg T3_NUDGE_TURN true)" = "true" ] || { R="T3_NUDGE_TURN=false"; return 1; }
+  local f="$HANDOFF_DIR/state/$SID.nudge.txt"
+  printf '[handoff plugin] %s\n\n(Sent by the handoff plugin as a separate turn so that your previous reply stays the visible answer in T3 Code.)\n' "$1" > "$f"
+  R="$(bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG" "$SID" nudge "$f")"
+  case "$R" in *scheduled*) return 0;; *) return 1;; esac
+}
+# emit_nudge <systemMessage> <context>: T3 turn when possible, else in-turn additionalContext.
+emit_nudge() {
+  if t3_nudge "$2"; then
+    jq -nc --arg m "$1 Delivered as a separate T3 turn so this reply stays visible. ${R}" '{systemMessage:$m}'
+  else
+    jq -nc --arg m "$1${R:+ (T3 turn not used: $R)}" --arg ctx "$2" '{systemMessage:$m, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}'
+  fi
+}
+
 # ---- final handoff at threshold
 if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   ATTEMPTS="$(state_get "$SID" final_attempts)"; ATTEMPTS="${ATTEMPTS:-0}"
@@ -27,16 +49,15 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   # last write, ask for a refresh instead of restaging a stale document.
   if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ] && [ "$ACTIVE" != "true" ] && [ $((CTX - FINAL_AT)) -ge "$LIVE_EVERY" ]; then
     state_set "$SID" final_written_ctx "$CTX"
-    jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}), ${LIVE_EVERY}+ tokens past the last handoff. Asking Claude to refresh the handoff document. Then /clear (the plugin does not clear by itself unless T3_AUTOCLEAR is on)." \
-           --arg ctx "The context window is at ${CTX} tokens, past the handoff limit of ${THR}, and the handoff document $F is out of date. Before stopping: update it so every section reflects the current state (overwrite with Write; Standing instructions and Decisions log are append-only, add new entries and re-tag old ones). ${SECTIONS} Then stop; do not continue the task." \
-      '{systemMessage:$m, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}'
+    emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}), ${LIVE_EVERY}+ tokens past the last handoff. Asking Claude to refresh the handoff document. Then /clear (the plugin does not clear by itself unless T3_AUTOCLEAR is on)." \
+               "The context window is at ${CTX} tokens, past the handoff limit of ${THR}, and the handoff document $F is out of date. Before stopping: update it so every section reflects the current state (overwrite with Write; Standing instructions and Decisions log are append-only, add new entries and re-tag old ones). ${SECTIONS} Then stop; do not continue the task."
     exit 0
   fi
   if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ]; then
     [ "$ACTIVE" = "true" ] && state_set "$SID" final_written_ctx "$CTX"
     publish "$F"
     if [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ "$(state_get "$SID" t3_scheduled)" != "1" ]; then
-      state_set "$SID" t3_scheduled 1; R="$(bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG" "$SID")"
+      state_set "$SID" t3_scheduled 1; R="$(bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG" "$SID" clear)"
       case "$R" in
         *scheduled*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; T3 auto-clear scheduled (/clear then /handoff:resume once this turn ends). ${R}" '{systemMessage:$m}';;
         *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged. T3 auto-clear skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
@@ -59,9 +80,8 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   else
     WHAT="Write the handoff document with the Write tool to $F."
   fi
-  jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Asking Claude to write the handoff document before it stops." \
-         --arg ctx "The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task." \
-    '{systemMessage:$m, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}'
+  emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}). Asking Claude to write the handoff document before it stops." \
+             "The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task."
   exit 0
 fi
 
@@ -71,9 +91,8 @@ if [ "$LIVE_FROM" -gt 0 ] && [ "$CTX" -ge "$LIVE_FROM" ] && [ "$ACTIVE" != "true
   if [ $((CTX - LAST)) -ge "$LIVE_EVERY" ]; then
     state_set "$SID" live_ctx "$CTX"
     if [ -s "$F" ]; then WHAT="Update the running handoff document $F so it reflects the current state (overwrite with Write). Standing instructions and Decisions log are append-only: add new entries, mark old ones superseded/reversed, never delete. Keep the other sections under ~100 lines."; else WHAT="Create a running handoff document with the Write tool at $F (other sections under ~100 lines; Standing instructions and Decisions log complete)."; fi
-    jq -nc --arg m "Handoff: context is ${CTX} tokens (live state from ${LIVE_FROM}). Asking Claude to update the running handoff." \
-           --arg ctx "Context is at ${CTX} tokens. Before stopping: ${WHAT} ${SECTIONS} It is a working copy that a fresh context could resume from if this one is lost. Then stop." \
-      '{systemMessage:$m, hookSpecificOutput:{hookEventName:"Stop", additionalContext:$ctx}}'
+    emit_nudge "Handoff: context is ${CTX} tokens (live state from ${LIVE_FROM}). Asking Claude to update the running handoff." \
+               "Context is at ${CTX} tokens. Before stopping: ${WHAT} ${SECTIONS} It is a working copy that a fresh context could resume from if this one is lost. Then stop."
     exit 0
   fi
 fi
