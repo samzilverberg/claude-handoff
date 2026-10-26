@@ -138,6 +138,8 @@ Rejected alternatives: `/compact` (keeps the session id, but costs a summarizati
 prompt can only be extended, not replaced, so it cannot write the handoff itself), a successor thread per handoff
 (one more sidebar entry each time), writing T3's db (event-sourced, not ours to edit), and
 importing the new session into the thread (`thread.create` with `importedNativeThread` opens it as a new session).
+Full record (what was tried and measured, how to verify, exit plan once T3 ships the upstream fix
+[pingdotgg/t3code#24168](https://github.com/pingdotgg/t3code/pull/24168)): [docs/t3-clear-session-workaround.md](docs/t3-clear-session-workaround.md).
 
 Recovery of threads `/clear`ed by plugin <= 0.5 (or after a failed alias): when T3 resumes such a stale session and
 the user types into it, the UserPromptSubmit hook blocks the prompt (0 tokens; T3 shows the reason as a notice),
