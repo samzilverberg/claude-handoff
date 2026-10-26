@@ -10,9 +10,11 @@ log sessionstart "source=$SRC sid=$SID pid=$CPID owner=$(owner_pid)"
 # resurrected pre-clear session (e.g. a T3 host resume cursor that never advanced to the new session).
 # Tell the model to stop before it re-runs the work; its Stop/PreCompact hooks are inert too.
 if [ "$SRC" != "clear" ] && is_tombstoned "$SID"; then
-  CB="$(tombstone_get "$SID" continued_by)"; WHEN="$(tombstone_get "$SID" cleared_at)"
-  log sessionstart "TOMBSTONED sid=$SID (cleared_at=$WHEN continued_by=${CB:-?}); injecting stop"
-  echo "STOP — stale session resume. This session ($SID) was handed off and /cleared${WHEN:+ at $WHEN}${CB:+, and its work continues in session $CB}. This is a leftover resume of an already-superseded session (typically the T3 host resuming the pre-/clear session id after an in-process /clear). Do NOT continue the task, edit files, run tools, or write a handoff — doing so duplicates work the successor session already did. Tell the user this thread was resumed onto a stale, superseded session and stop."
+  WHEN="$(tombstone_get "$SID" cleared_at)"; TAIL="$(chain_tail "$SID")"
+  log sessionstart "TOMBSTONED sid=$SID (cleared_at=$WHEN tail=$TAIL); injecting stop"
+  if [ "$TAIL" != "$SID" ]; then WHERE="in Claude session $TAIL (\`claude --resume $TAIL\` in $ROOT)"
+  else WHERE="in a newer session"; fi
+  echo "STOP — stale session resume. This session ($SID) was handed off${WHEN:+ at $WHEN}; the work continues $WHERE. This is a leftover resume of an already-superseded session (typically a host resuming the pre-/clear session id). Do NOT continue the task, edit files, run tools, or write a handoff: that duplicates work the successor already did. Tell the user where the work continues (quote the location above) and stop."
   exit 0
 fi
 
@@ -23,20 +25,30 @@ say_ctx() { OUT="${OUT:+$OUT
 
 case "$SRC" in
   clear|compact)
+    T3_RESUMING=""
+    if [ "$SRC" = "clear" ]; then
+      # the session this /clear superseded (same pid; bridged by SessionEnd(clear)): link it to this one
+      B="$HANDOFF_DIR/state/pid-cleared/$CPID"; OLD="$(cat "$B" 2>/dev/null)"; rm -f "$B"
+      if [ -n "$OLD" ] && [ "$OLD" != "$SID" ]; then
+        tombstone_link "$OLD" "$SID"
+        [ "$(state_get "$(session_key "$OLD")" t3_clear)" = "1" ] && T3_RESUMING=1   # t3.sh sends /handoff:resume itself
+        # T3 layer: make the Claude session id T3 resumes for this thread follow this new session
+        if [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
+          HANDOFF_TRANSCRIPT="$(jq -r '.transcript_path // empty' <<<"$IN")" bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" alias "$OLD" >/dev/null 2>&1
+        fi
+        mkdir -p "$HANDOFF_DIR/state/cleared"; echo "$SID" > "$HANDOFF_DIR/state/cleared/$OLD"
+      fi
+    else
+      # compact keeps the session id: start the per-context-window state over (attempt counters, latches)
+      rm -f "$HANDOFF_DIR/state/$(session_key "$SID").json"
+    fi
     MINE="$HANDOFF_DIR/by-pid/$CPID.md"
     if [ -s "$MINE" ]; then
       cp "$MINE" "$CURRENT"; echo "$CPID" > "$OWNER"; log sessionstart "current.md <- by-pid/$CPID.md"
-      # Without the CLAUDE.md import, the handoff is loaded on demand: tell Claude it exists.
-      if ! grep -qs '@.claude/handoff/current.md' "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md" 2>/dev/null; then
+      # Without the CLAUDE.md import, the handoff is loaded on demand: tell Claude it exists
+      # (not when the T3 layer is about to send /handoff:resume itself).
+      if [ -z "$T3_RESUMING" ] && ! grep -qs '@.claude/handoff/current.md' "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md" 2>/dev/null; then
         say_ctx "A handoff document from the previous context window of this conversation is staged (written at the user's request before the context was cleared). Before doing anything else, invoke the handoff:resume skill to load it, then continue from its Next steps."
-      fi
-    fi
-    # Link the just-cleared session (same pid) to this successor, for the zombie-stop note above.
-    if [ "$SRC" = "clear" ]; then
-      B="$HANDOFF_DIR/state/pid-cleared/$CPID"
-      if [ -f "$B" ]; then
-        OLD="$(cat "$B" 2>/dev/null)"; [ -n "$OLD" ] && [ "$OLD" != "$SID" ] && tombstone_link "$OLD" "$SID"
-        rm -f "$B"
       fi
     fi ;;
   startup|fork|resume)
@@ -54,8 +66,8 @@ esac
 # T3_AUTOCLEAR preflight on startup/resume: warn now, not first at the threshold. Silent when fine or not a T3 host.
 WARN=""
 if [ "$SRC" != "clear" ] && [ "$SRC" != "compact" ] && [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
-  R="$(bash "$(dirname "$0")/t3-autoclear.sh" "$ROOT" "$LOG" "" check 2>/dev/null)"
-  case "$R" in ok:*|"not a T3 Code session"*) ;; *) WARN="handoff: T3_AUTOCLEAR is on but auto-clear will not work here ($R). At the threshold you will need to /clear + /handoff:resume by hand." ;; esac
+  R="$(bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "" check 2>/dev/null)"
+  case "$R" in ok:*|"not a T3 Code session"*) ;; *) WARN="handoff: T3_AUTOCLEAR is on but the automatic T3 handoff will not work here ($R). At the threshold you will need to /clear + /handoff:resume by hand." ;; esac
 fi
 if [ -n "$WARN" ]; then
   if [ -n "$OUT" ]; then jq -nc --arg m "$WARN" --arg c "$OUT" '{systemMessage:$m, hookSpecificOutput:{hookEventName:"SessionStart", additionalContext:$c}}'

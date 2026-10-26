@@ -1,6 +1,6 @@
 ---
 name: resume
-description: Resume work from the handoff document staged by the previous context window of this session (after /clear). Use when the user says "resume", "continue from handoff", or right after a session-start note says a handoff is staged.
+description: Resume work from the handoff document staged by the previous context window of this session (after /clear or /compact). Use when the user says "resume", "continue from handoff", or right after a session-start note says a handoff is staged.
 allowed-tools: Read
 ---
 
@@ -10,4 +10,4 @@ allowed-tools: Read
 
 ## Your task
 
-The document above was written by the previous context window of this same conversation, at the user's request, just before the context was cleared. Treat it as the record of the work so far. Continue from "Next steps"; if "Open questions for the user" is non-empty, ask those first. $ARGUMENTS
+The document above was written by the previous context window of this same conversation, at the user's request, just before the context was cleared or compacted. If a compacted summary of the earlier conversation is also in your context, this document is the more complete and more recent record: where they differ, follow the document. Treat it as the record of the work so far. Continue from "Next steps"; if "Open questions for the user" is non-empty, ask those first. A step that waits for the user (their confirmation, an answer, a "go") stays waiting: say briefly where things stand and stop, do not do it on their behalf. $ARGUMENTS

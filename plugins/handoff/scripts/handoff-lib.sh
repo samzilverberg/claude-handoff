@@ -19,6 +19,10 @@ cfg() { local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"; [ -n "$
 # state get/set per session (tiny json)
 state_get() { local f="$HANDOFF_DIR/state/$1.json"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" || true; }
 state_set() { local f="$HANDOFF_DIR/state/$1.json"; local cur='{}'; [ -f "$f" ] && cur="$(cat "$f")"; jq -c --arg k "$2" --arg v "$3" '.[$k]=$v' <<<"$cur" > "$f"; }
+# session_key <sid>: key for per-context-window state and the handoff doc. The T3 layer (t3.sh alias) maps every
+# post-/clear session of a thread to the Claude session id T3 resumes, so both carry over a T3 respawn that comes
+# back under that id. Elsewhere: the sid itself.
+session_key() { local k; k="$(cat "$HANDOFF_DIR/state/aliased-by/$1" 2>/dev/null)"; echo "${k:-$1}"; }
 REQUIRED_SECTIONS="Goal|Standing instructions|Decisions|Current state|In progress|Next steps|Key files|Gotchas|Open questions"
 # missing_sections <file> -> prints missing section names (one per line); empty when all present
 missing_sections() { local f="$1"; echo "$REQUIRED_SECTIONS" | tr '|' '\n' | while read -r sec; do grep -qiE "^##+ .*${sec}" "$f" 2>/dev/null || echo "$sec"; done; }
@@ -131,6 +135,8 @@ tombstone_set() {
     '{cleared_by_pid:$pid, cleared_at:$at, cleared_ts:$ts}' > "$(tombstone_file "$1")"
   log tombstone "set sid=$1 by pid=$2"
 }
+# chain_tail <sid>: follow continued_by links to the newest session (bounded); <sid> itself when none
+chain_tail() { local cur="$1" nx i=0; while [ $i -lt 20 ]; do nx="$(tombstone_get "$cur" continued_by)"; [ -n "$nx" ] || break; cur="$nx"; i=$((i+1)); done; echo "$cur"; }
 # tombstone_link <sid> <continued_by_sid> : record the successor session (best-effort note only).
 tombstone_link() {
   local f cur; f="$(tombstone_file "$1")"; [ -f "$f" ] || return 0

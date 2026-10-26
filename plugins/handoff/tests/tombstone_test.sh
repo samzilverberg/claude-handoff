@@ -54,7 +54,7 @@ is_tombstoned "$SID_NEW" && bad "successor must NOT be tombstoned" || ok "succes
 # --- integration: resuming the tombstoned (zombie) sid is told to stop ------
 OUT="$(hook handoff-sessionstart.sh "{\"source\":\"resume\",\"session_id\":\"$SID_OLD\"}")"
 case "$OUT" in *"STOP — stale session resume"*) ok "SessionStart(resume) of zombie injects STOP";; *) bad "zombie stop note" "$OUT";; esac
-case "$OUT" in *"continues in session $SID_NEW"*) ok "stop note names successor";; *) bad "stop note successor name" "$OUT";; esac
+case "$OUT" in *"continues in Claude session $SID_NEW (`claude --resume $SID_NEW`"*) ok "stop note names successor + resume command";; *) bad "stop note successor name" "$OUT";; esac
 # control: resuming the live successor sid is NOT stopped
 OUT="$(hook handoff-sessionstart.sh "{\"source\":\"resume\",\"session_id\":\"$SID_NEW\"}")"
 case "$OUT" in *"STOP — stale session resume"*) bad "live successor must not be stopped" "$OUT";; *) ok "live successor resume not stopped";; esac

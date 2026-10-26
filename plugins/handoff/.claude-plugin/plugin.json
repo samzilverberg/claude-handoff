@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -60,14 +60,14 @@
     },
     "T3_AUTOCLEAR": {
       "type": "boolean",
-      "title": "T3 Code auto-clear (experimental)",
-      "description": "Inside a T3 Code thread: deliver the handoff-writing request as its own turn (so the reply you were reading stays visible in T3's timeline), then once the handoff is staged send /clear and /handoff:resume to that thread via t3ctl.",
+      "title": "T3 Code: automatic /clear + resume in the same thread",
+      "description": "Inside a T3 Code thread (T3 Code (Beta) >= 0.1.0, t3ctl): ask for the handoff as its own turn, then once it is staged send /clear and /handoff:resume to the thread, and alias the Claude session id T3 resumes to the new session (symlinked transcript) so a T3 respawn cannot bring back the pre-clear context. Threads /cleared by plugin <= 0.5 are recovered on their next message. Elsewhere: no effect.",
       "default": false
     },
     "T3_NUDGE_TURN": {
       "type": "boolean",
       "title": "T3: handoff request as its own turn",
-      "description": "With T3_AUTOCLEAR: true sends the handoff-writing request to the thread as a separate turn (keeps the previous reply visible). false uses the in-turn Stop nudge as before; auto-clear still runs.",
+      "description": "With T3_AUTOCLEAR: true sends the handoff-writing request to the thread as a separate turn (keeps the previous reply visible). false uses the in-turn Stop nudge; the automatic /clear still runs.",
       "default": true
     }
   },
