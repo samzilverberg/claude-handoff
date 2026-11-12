@@ -1,12 +1,12 @@
 ---
 name: resume
-description: Resume work from the handoff document staged by the previous context window of this session (after /clear or /compact). Use when the user says "resume", "continue from handoff", or right after a session-start note says a handoff is staged.
+description: Resume work from the handoff document staged by the previous context window of this session (after /clear or /compact, or a fresh session of the same T3 Code thread). Use when the user says "resume", "continue from handoff", or right after a session-start note says a handoff is staged.
 allowed-tools: Read
 ---
 
 ## Handoff from the previous context window of this session
 
-!`d="${CLAUDE_PROJECT_DIR}/.claude/handoff"; p=$(ps -o ppid= -p $PPID | tr -d ' '); f="$d/by-pid/$p.md"; [ -s "$f" ] || f="$d/current.md"; if [ -s "$f" ]; then cat "$f"; else echo "(no handoff staged under $d)"; fi`
+!`d="${CLAUDE_PROJECT_DIR}/.claude/handoff"; p=$(ps -o ppid= -p $PPID | tr -d ' '); f="$d/by-pid/$p.md"; [ -s "$f" ] || f="$d/by-thread/$(printf '%s' "${T3CODE_THREAD_ID:-none}" | tr '/' '_').md"; [ -s "$f" ] || f="$d/current.md"; if [ -s "$f" ]; then cat "$f"; else echo "(no handoff staged under $d)"; fi`
 
 ## Your task
 

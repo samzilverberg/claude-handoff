@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -61,7 +61,7 @@
     "T3_AUTOCLEAR": {
       "type": "boolean",
       "title": "T3 Code: automatic /clear + resume in the same thread",
-      "description": "Inside a T3 Code thread (T3 Code (Beta) >= 0.1.0, t3ctl): ask for the handoff as its own turn, then once it is staged send /clear and /handoff:resume to the thread, and alias the Claude session id T3 resumes to the new session (symlinked transcript) so a T3 respawn cannot bring back the pre-clear context. Threads /cleared by plugin <= 0.5 are recovered on their next message. Elsewhere: no effect.",
+      "description": "Inside a T3 Code thread (T3 Code (Beta) >= 0.1.0, t3ctl): ask for the handoff as its own turn, then once it is staged continue the thread in a fresh Claude session: on T3 Code >= 0.1.9 (t3ctl >= 0.8.0) one /handoff:resume sent as a fresh session, which T3 records itself; on older T3, /clear + /handoff:resume with the Claude session id T3 resumes aliased to the new session (symlinked transcript) so a T3 respawn cannot bring back the pre-clear context. Threads /cleared by plugin <= 0.5 are recovered on their next message. Elsewhere: no effect.",
       "default": false
     },
     "T3_NUDGE_TURN": {

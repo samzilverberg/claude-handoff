@@ -3,7 +3,7 @@
 Auto-compact fires mid-turn and its summary drops decisions. This plugin instead acts **at the end of the turn**
 that crosses a context threshold: Claude writes a structured handoff document itself, the plugin stages it,
 **you type `/clear`**, and the fresh context resumes from it via `/handoff:resume`. Under T3 Code an optional layer
-(`T3_AUTOCLEAR`) types `/clear` + `/handoff:resume` for you, in the same thread, and keeps T3 pointed at the live session. Running `/handoff:resume` without `/clear` just adds the document on top of the full context. Auto-compact stays on only as a safeguard far above the
+(`T3_AUTOCLEAR`) does it for you, in the same thread: on T3 Code >= 0.1.9 it sends `/handoff:resume` as a fresh session (T3's own `/clear`), on older T3 it types `/clear` + `/handoff:resume` and keeps T3 pointed at the live session. Running `/handoff:resume` without `/clear` just adds the document on top of the full context. Auto-compact stays on only as a safeguard far above the
 threshold. Verified against Claude Code 2.1.263 with 18 driven test sessions plus real long sessions.
 
 ```
@@ -24,7 +24,7 @@ safeguard: auto-compact window ≈ THRESHOLD + 100k; PreCompact stages a handoff
 
 * macOS (the hooks use BSD `stat`/`ps`; they disable themselves with a notice on other OSes)
 * Claude Code ≥ 2.1.263, `bash`, `jq`
-* Optional, only for the T3 layer (`T3_AUTOCLEAR`): [T3 Code](https://github.com/pingdotgg/t3code) **(Beta) >= 0.1.0**, i.e. the release whose state db is `~/.t3/userdata/statev2.sqlite` (older T3 with only `state.sqlite` is refused with a message, no fallback), [`t3ctl`](https://github.com/samzilverberg/t3ctl) on PATH, and `sqlite3` (ships with macOS)
+* Optional, only for the T3 layer (`T3_AUTOCLEAR`): [T3 Code](https://github.com/pingdotgg/t3code) **(Beta) >= 0.1.0**, i.e. the release whose state db is `~/.t3/userdata/statev2.sqlite` (older T3 with only `state.sqlite` is refused with a message, no fallback), [`t3ctl`](https://github.com/samzilverberg/t3ctl) on PATH, and `sqlite3` (ships with macOS). The fresh-session flow needs T3 Code >= 0.1.9 (capability `freshContext`) and t3ctl >= 0.8.0 (`threads send --fresh`); without them the layer uses the `/clear` + alias flow
 
 ## Install
 
@@ -56,7 +56,7 @@ exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 | `MODE` | inject | PreCompact safeguard: `inject` stages a handoff and lets compaction run; `block` refuses proactive auto-compact and asks for `/clear` |
 | `MODEL` / `EFFORT` | claude-opus-4-8 / medium | Nested `claude -p` summarizer, used only when Claude did not write the handoff itself |
 | `STARTUP` | ignore | Fresh startup that finds another live session's staged handoff: `ignore` (inject a "not yours" note) or `adopt` |
-| `T3_AUTOCLEAR` | false | T3 layer, inside a T3 Code thread only (see "T3 Code"). The handoff-writing request goes to the thread as its own turn; once the handoff is staged the plugin sends `/clear` and `/handoff:resume` **to the same thread**, and aliases the Claude session id T3 resumes to the new session (so a T3 respawn cannot bring back the pre-clear context). Threads `/clear`ed by plugin <= 0.5 are recovered on their next message. Requires T3 Code (Beta) >= 0.1.0 and t3ctl. Off, or wherever the preflight fails: the base `/clear` + `/handoff:resume` path |
+| `T3_AUTOCLEAR` | false | T3 layer, inside a T3 Code thread only (see "T3 Code"). The handoff-writing request goes to the thread as its own turn; once the handoff is staged the plugin continues **the same thread** in a fresh Claude session: T3 Code >= 0.1.9 gets one `/handoff:resume` sent as a fresh session (T3 records the new session itself); older T3 gets `/clear` + `/handoff:resume`, with the Claude session id T3 resumes aliased to the new session (so a T3 respawn cannot bring back the pre-clear context). `HANDOFF_T3_FRESH=false` (env) forces the older flow. Threads `/clear`ed by plugin <= 0.5 are recovered on their next message. Requires T3 Code (Beta) >= 0.1.0 and t3ctl. Off, or wherever the preflight fails: the base `/clear` + `/handoff:resume` path |
 | `T3_NUDGE_TURN` | true | With `T3_AUTOCLEAR`: `true` sends the handoff-writing request as its own turn; `false` uses the in-turn Stop nudge (the automatic /clear still runs). Flip it to compare while testing |
 | `T3_SEND_TIMEOUT` | 600 | Seconds the T3 helper waits for the thread to go idle (and retries a send refused because the thread was busy) |
 
@@ -113,9 +113,41 @@ has no API for a hook to clear the context, so outside T3 those two keystrokes s
 [T3 Code](https://github.com/pingdotgg/t3code) thread, using [`t3ctl`](https://github.com/samzilverberg/t3ctl) (a CLI
 for the running T3 Code app) and read-only lookups in T3's state db.
 
+Since 0.7 there are two flows. T3 Code (Beta) **0.1.9** added fresh sessions (`freshContext` on a send; the
+composer's `/clear` arms it for the next message): T3 starts a new Claude session in the **same thread** and records
+its id itself, so the stale-resume problem below cannot happen on that path. The layer uses it when the server
+advertises the capability, t3ctl has `threads send --fresh` (>= 0.8.0) and the process knows its thread
+(`T3CODE_THREAD_ID`, which T3 exports to its agents); otherwise it falls back to the 0.6 `/clear` + alias flow.
+`t3.sh check` (and `/handoff:status`) names the flow and why.
+
+Fresh flow (T3 Code >= 0.1.9):
+
 ```
 turn ends at ≥ THRESHOLD ─Stop─▶ t3.sh nudge: once the thread is idle, send "[handoff plugin] … write the handoff"
                                   as its own turn (the reply you were reading stays the turn's visible message)
+handoff written ─Stop─▶ stage it: by-pid/<pid>.md, current.md, and by-thread/<T3 thread>.md (+ .json: staging session)
+                 ─▶ t3.sh clear: once idle, `t3ctl threads send <thread> --fresh "/handoff:resume"`
+     T3 detaches the old session: its process ends with SessionEnd(other)
+     new process, SessionStart(startup): adopts by-thread/<thread>.md (→ by-pid/<new pid>.md, current.md), tombstones
+                                         the old session (continued_by = the new one), archives the per-thread copy
+     /handoff:resume loads the doc; the fresh context continues from Next steps. T3 records the new session id, so a
+     later respawn runs `--resume <new id>`: no alias, no stale context
+```
+
+The same adoption fixes the manual T3 path: composer `/clear` then `/handoff:resume` (or any message: the
+SessionStart note asks Claude to load the staged handoff). Before 0.7 the fresh session found nothing: the old
+process's `SessionEnd(other)` reset `current.md` and the new pid had no `by-pid` copy, so `/handoff:resume` loaded
+"(none)" (reproduced on 0.1.9 with plugin 0.6.0). The adoption only runs on `startup` of a process whose
+`T3CODE_THREAD_ID` has a staged doc: plain CLI sessions, other threads and respawns (`resume`) adopt nothing, and a
+`/clear` or compact that consumes the doc in-process drops the per-thread copy. T3 refuses a fresh send while the
+current session still runs background agents or commands; the helper retries after each idle until
+`T3_SEND_TIMEOUT` and then reports the last refusal.
+
+`/clear` flow (T3 Code 0.1.0 – 0.1.8, `HANDOFF_T3_FRESH=false`, or plain `/clear` text sent through the API, which T3
+0.1.9 still passes to Claude Code):
+
+```
+turn ends at ≥ THRESHOLD ─Stop─▶ t3.sh nudge (as above)
 handoff written ─Stop─▶ stage it ─▶ t3.sh clear: once idle, send "/clear" to the same thread
      SessionEnd(clear): stage the handoff, tombstone the cleared session
      SessionStart(clear) ─▶ t3.sh alias: <R>.jsonl (R = the Claude session id T3 recorded for the thread)
@@ -144,11 +176,13 @@ Full record (what was tried and measured, how to verify, exit plan once T3 ships
 Recovery of threads `/clear`ed by plugin <= 0.5 (or after a failed alias): when T3 resumes such a stale session and
 the user types into it, the UserPromptSubmit hook blocks the prompt (0 tokens; T3 shows the reason as a notice),
 stages the newest handoff document of the session's `/clear` chain with a digest of the later sessions' user and
-assistant text inlined (full digest: `.claude/handoff/recovery/<sid>-digest.md`), and runs the same `/clear` (which
-aliases the stale session to the fresh one) + `/handoff:resume`, with the user's message passed to `/handoff:resume`.
+assistant text inlined (full digest: `.claude/handoff/recovery/<sid>-digest.md`), and runs the handoff with the
+user's message passed to `/handoff:resume`: a fresh session where available (the stale session stays tombstoned),
+else `/clear` (which aliases the stale session to the fresh one) + `/handoff:resume`. Threads already aliased by 0.6
+keep working: their next handoff on 0.1.9 simply moves them to a fresh session, and the old links stay in place.
 
 Requirements: T3 Code (Beta) **>= 0.1.0** (state db `~/.t3/userdata/statev2.sqlite`; older T3 is refused with
-"only the legacy T3 db … T3 Code too old") and t3ctl. Setup: install `t3ctl` per its README
+"only the legacy T3 db … T3 Code too old") and t3ctl; the fresh flow needs T3 Code >= 0.1.9 and t3ctl >= 0.8.0. Setup: install `t3ctl` per its README
 (`pnpm install && pnpm build && pnpm link --global`), then `/plugin configure handoff@claude-handoff` →
 `T3_AUTOCLEAR=true`, and set "Auto-compact after" in T3 Code's Claude settings ~100k above `THRESHOLD`.
 
@@ -157,9 +191,9 @@ Requirements: T3 Code (Beta) **>= 0.1.0** (state db `~/.t3/userdata/statev2.sqli
 Stop says: Handoff: context is 362104 tokens (limit 350000). Asking Claude to write the handoff document before it stops. Delivered as a separate T3 turn so this reply stays visible. nudge scheduled for thread <id> …
 > [handoff plugin] The context window is at 362104 tokens … Write the handoff document …      (sent by the helper)
 Claude: [Write .claude/handoff/sessions/<sid>.md] Handoff written.
-Stop says: Handoff: context is 363900 tokens (limit 350000). Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. …
-> /clear                                              (sent by the helper)
-> /handoff:resume                                     (sent by the helper; Claude continues from Next steps)
+Stop says: Handoff: context is 363900 tokens (limit 350000). Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). …
+> /handoff:resume                                     (sent by the helper as a fresh session; Claude continues from Next steps)
+(older T3: "> /clear" then "> /handoff:resume", both sent by the helper)
 ```
 
 Safety and future-proofing. The helper checks every moving part before acting and names the one that is off:
@@ -167,17 +201,19 @@ host is T3 Code (`__CFBundleIdentifier=com.t3tools.t3code` or a "T3 Code" ancest
 Superset sessions never touch a thread; `t3ctl` and `sqlite3` on PATH;
 `statev2.sqlite` present and readable, table `orchestration_v2_projection_provider_threads` with `thread_id`,
 `updated_at`, `payload_json`, rows carrying `payload_json.nativeThreadRef.nativeId`; T3 server reachable via
-`t3ctl env` (5 s cap), supported, >= 0.1.0. The thread is resolved by this session's exact Claude session id
+`t3ctl env` (5 s cap), supported, >= 0.1.0; for the fresh flow also `capabilities.freshContext`, t3ctl >= 0.8.0
+and `T3CODE_THREAD_ID` equal to the resolved thread. The thread is resolved by this session's exact Claude session id
 (`nativeThreadRef.nativeId`; for sessions `/clear`ed in place, via the plugin's own `/clear` tombstone chain back to
 the id T3 recorded); it must exist, not be archived, and work in this project dir (its worktree, or for local
-threads its project's workspace root); the mapping is re-checked right before every send, and `/handoff:resume` goes out only after the new session is seen. The alias step runs inside SessionStart and is local only (db read + one symlink), so it works even if the T3 server is slow. The db is only ever read;
+threads its project's workspace root); the mapping is re-checked right before every send, and (`/clear` flow) `/handoff:resume` goes out only after the new session is seen; (fresh flow) the helper waits for the fresh session to adopt the doc and checks that T3 records its id. The alias step runs inside SessionStart and is local only (db read + one symlink), so it works even if the T3 server is slow. The db is only ever read;
 writes go through `t3ctl`. A failed preflight is reported at SessionStart (not first at the threshold), every skip
 in the Stop message, every attempt in `hooks.log` (`[t3]`); the base path applies whenever the T3 layer cannot act.
 
 Troubleshooting: `/handoff:status` (or `bash plugins/handoff/scripts/t3.sh <project> /dev/null <session id> check`)
 prints `ok: …` or the blocking reason. `HANDOFF_T3_DRYRUN=1` resolves without acting. A failed automatic handoff
-is reported in the next Stop message; the manual fallback is `/clear` then `/handoff:resume` (the alias still runs on a
-typed `/clear`). To undo an alias: replace `<R>.jsonl` with `<R>.jsonl.pre-handoff`.
+is reported in the next Stop message; the manual fallback is `/clear` then `/handoff:resume` (in the T3 composer `/clear`
+starts a fresh session on 0.1.9, which adopts the staged doc; on older T3 the alias still runs on a typed `/clear`).
+To undo an alias: replace `<R>.jsonl` with `<R>.jsonl.pre-handoff`.
 
 ## Verified facts (hooks reference + 18 driven sessions)
 
@@ -202,6 +238,9 @@ typed `/clear`). To undo an alias: replace `<R>.jsonl` with `<R>.jsonl.pre-hando
 | Claude Code `--resume A` with `A.jsonl` a symlink to `B.jsonl` loads B's conversation, reports session id A (stream-json `init`), appends through the link, and a later resume follows the mixed chain | `claude -p` (haiku), plain and stream-json, 2026-10-26 |
 | T3 layer end to end on T3 Code 0.1.2 (sonnet, threshold 60k): threshold at 73k → nudge turn → handoff → `/clear` → alias → `/handoff:resume` (~2 s for the last three), context 74k → 37k; a fact given after the `/clear`; forced respawn (runtime-mode change: T3 ran `claude --resume=<pre-clear id>`) resumed the post-clear context (39.6k, fact known, no zombie note); a second handoff from the respawned process re-pointed the alias and survived another respawn | throwaway project, 2026-10-26 |
 | `UserPromptSubmit` `decision:block` under T3: no model call, run ends idle, reason rendered as a `system_notice` turn item | T3 provider event log + `orchestration_v2_projection_turn_items` |
+| T3 Code 0.1.9 fresh session (`message.dispatch` with `freshContext: true`, capability `freshContext`): the old Claude process ends with `SessionEnd(other)`, a new process starts with `SessionStart(startup)` in the same thread (the order of the two varies), T3 adds a provider-thread row whose `nativeThreadRef.nativeId` is the new session id, and a later respawn runs `--resume=<new id>`. T3 exports `T3CODE_THREAD_ID` to the agent process (hooks inherit it). Plain `/clear` text sent through the API still reaches Claude Code's `/clear` | server bundle of 0.1.9 (`runtimeLayer`, `ManagedEndpointRuntime`); hooks.log + statev2.sqlite, 2026-11-12 |
+| Plugin 0.6.0 on T3 0.1.9: a fresh `/handoff:resume` loaded "(none)": the old process's `SessionEnd(other)` reset `current.md`, the new pid had no `by-pid` copy; the model answered "Fresh session — no prior work" | throwaway project, 2026-11-12 |
+| Fresh flow end to end on T3 Code 0.1.9 (sonnet, threshold 55k): threshold at 72.5k → nudge turn → handoff → one `/handoff:resume` sent `--fresh` → adopted within ~1 s, T3 recorded the new id, context 82k → 50k, the resumed session did the plan's next steps; a fact given after the handoff; forced respawn (runtime-mode change) ran `--resume=<new id>` and knew that fact and the pre-handoff one from the doc. Manual path (`--fresh` `/handoff:resume`, and `--fresh` "continue" → Claude invoked `handoff:resume` from the SessionStart note) loaded the doc | throwaway project, 2026-11-12 |
 
 ## Comparison with public alternatives (source read 2026-09-08)
 
@@ -233,7 +272,8 @@ and `PreCompact` hooks go **inert** so it can never re-stage stale content. A no
 Residual: the guard makes the zombie *harmless* but cannot stop the host from spawning it; the model
 is only *asked* to stop. Under T3 the layer goes further: the zombie's prompts are blocked before any model call and
 forwarded (or the thread is recovered), and since 0.6 the T3 layer no longer `/clear`s in place at all (see "T3 Code
-layer"), so it creates no new zombies. Hosts other than T3 keep the note-only guard. Two concurrent `--resume` of the *same* never-cleared id (a separate host duplicate-spawn
+layer"), so it creates no new zombies; since 0.7 it uses T3's own fresh sessions where available, which T3 tracks
+itself (the superseded session is tombstoned all the same). Hosts other than T3 keep the note-only guard. Two concurrent `--resume` of the *same* never-cleared id (a separate host duplicate-spawn
 bug) is also out of scope. Tests: `plugins/handoff/tests/tombstone_test.sh`.
 
 ## Caveats
@@ -242,8 +282,9 @@ bug) is also out of scope. Tests: `plugins/handoff/tests/tombstone_test.sh`.
 * Tests used sonnet-5 at low effort with tiny thresholds; behaviour at 300k with opus/fable should be better, not worse.
 * At Stop time the transcript lags by one assistant message, so the hook measures the context as of the previous model call (max over the last 3 usages). At 300k that is one tool call behind; a single huge read right before the turn ends is caught at the next turn end, or by the auto-compact safeguard.
 * Blocking auto-compact after the API already returned a context-limit error fails that request. Keep the window ≥ 100k above the threshold.
-* T3 layer history: <= 0.4 cleared in place via `/clear` + `/handoff:resume` sent with `t3ctl`; 0.5 moved thread resolution to `statev2.sqlite` after T3's db migration silently broke 0.4's lookup; 0.6 keeps `/clear` and aliases T3's recorded session to the post-clear one after finding that T3 0.1.x resumes the pre-clear session on respawn, and recovers threads left in that state. Driven end to end on T3 Code 0.1.2, including forced respawns (see Verified facts); the recovery path is covered by `tests/t3_test.sh` and its pieces (block, `/handoff:resume` with arguments, inlined digest) were driven live. Other hosts (Claude CLI, Cowork, Superset) have no known API to start a fresh context, so they keep the manual `/clear` + `/handoff:resume` path. Superset sessions are detectable via `SUPERSET_TAB_ID` if an adapter is ever wanted.
+* T3 layer history: <= 0.4 cleared in place via `/clear` + `/handoff:resume` sent with `t3ctl`; 0.5 moved thread resolution to `statev2.sqlite` after T3's db migration silently broke 0.4's lookup; 0.6 keeps `/clear` and aliases T3's recorded session to the post-clear one after finding that T3 0.1.x resumes the pre-clear session on respawn, and recovers threads left in that state; 0.7 uses T3 Code 0.1.9's fresh sessions (one `/handoff:resume` sent with `--fresh`; T3 records the new session, so no alias), keeps the 0.6 flow for older T3, and stages handoffs per T3 thread so a fresh session (also the composer's `/clear`) adopts them. 0.6 was driven end to end on T3 Code 0.1.2 and 0.7 on 0.1.9, both including forced respawns (see Verified facts); the recovery path is covered by `tests/t3_test.sh` and its pieces (block, `/handoff:resume` with arguments, inlined digest) were driven live. Other hosts (Claude CLI, Cowork, Superset) have no known API to start a fresh context, so they keep the manual `/clear` + `/handoff:resume` path. Superset sessions are detectable via `SUPERSET_TAB_ID` if an adapter is ever wanted.
 * The alias writes inside Claude Code's transcript dir: `<R>.jsonl` is a symlink, and the post-`/clear` transcripts hold entries under id R once T3 respawns. Claude Code's own `/resume` picker may list R next to the newest session (same content). Claude Code's transcript cleanup (`cleanupPeriodDays`) could remove the link of a thread idle that long; T3 would then fail to resume it. The thread's history, PR links, schedules and pins are untouched.
+* The fresh flow relies on T3 exporting `T3CODE_THREAD_ID` to its Claude process (verified on 0.1.9). A per-thread doc that was staged but never consumed (no `/clear`, no fresh session, no compaction) waits in `by-thread/` and is adopted by the next fresh session of that thread, as a staged doc in the CLI is loaded after the next `/clear`.
 * `t3ctl` JSON output can contain raw control characters that break `jq`; the helper strips them. When scripting `t3ctl threads new`, never pass an empty thread ref to `threads send`: it resolves to some other thread.
 
 ## License

@@ -56,18 +56,21 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   fi
   if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ]; then
     [ "$ACTIVE" = "true" ] && state_set "$KEY" final_written_ctx "$CTX"
-    publish "$F"
-    # T3 layer: /clear + /handoff:resume sent to this thread (t3.sh clear). t3_clear latches only once scheduled; a
-    # skip (thread not resolved, t3ctl missing …) is retried on the next Stop. Outcome: state/<sid>.t3clear.
+    publish "$F" "$SID"
+    # T3 layer (t3.sh clear): /handoff:resume in a fresh session of this thread, or /clear + /handoff:resume. t3_clear
+    # latches only once scheduled; a skip (thread not resolved, t3ctl missing …) is retried on the next Stop.
+    # Outcome: state/<sid>.t3clear.
     if [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ "$(state_get "$KEY" t3_clear)" = "1" ]; then
       RS="$(cat "$HANDOFF_DIR/state/$SID.t3clear" 2>/dev/null)"
       case "$RS" in
         failed:*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
-        *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; the automatic /clear + /handoff:resume is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
+        *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
       esac
     elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
       R="$(bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" clear "$F")"
       case "$R" in
+        *"fresh session) scheduled"*) state_set "$KEY" t3_clear 1
+                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
         *scheduled*) state_set "$KEY" t3_clear 1
                      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
         *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
@@ -78,7 +81,7 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
     exit 0
   fi
   if [ "$ATTEMPTS" -ge 2 ]; then
-    [ -s "$F" ] && publish "$F"
+    [ -s "$F" ] && publish "$F" "$SID"
     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff file is $( [ -s "$F" ] && echo "incomplete (missing: $(echo $MISSING | tr '\n' ' '))" || echo missing ); staged as-is. /clear will fall back to the transcript summarizer if needed." '{systemMessage:$m}'
     exit 0
   fi

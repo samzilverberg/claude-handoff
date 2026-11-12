@@ -54,11 +54,32 @@ context_tokens() {
     | (($u.input_tokens // 0) + ($u.cache_read_input_tokens // 0) + ($u.cache_creation_input_tokens // 0))) | max // 0' 2>/dev/null || echo 0
 }
 
-# Publish <file> as this process's handoff: current.md (imported by CLAUDE.md) + by-pid copy + owner marker.
+# T3 Code sets T3CODE_THREAD_ID (its thread id) in the env of the agent processes it runs. A T3 "fresh session"
+# (composer /clear, or a send with freshContext: T3 Code >= 0.1.9) replaces the process: the new session starts with
+# SessionStart(startup) in a new pid, so neither by-pid nor the /clear bridge reaches it. publish() therefore also
+# stages the doc per thread (by-thread/<thread>.md + .json: who staged it); SessionStart(startup) of the next session
+# of that thread adopts it (adopt_thread_doc), and a /clear or compact that consumes it in-process drops it.
+T3TID="${T3CODE_THREAD_ID:-}"
+BYTHREAD="$HANDOFF_DIR/by-thread"
+thread_doc() { printf '%s/%s' "$BYTHREAD" "$(printf '%s' "$T3TID" | tr '/' '_')"; }   # base path, no extension
+# drop_thread_doc [why]: the staged per-thread doc was consumed (or superseded): archive it
+drop_thread_doc() {
+  [ -n "$T3TID" ] || return 0; local b; b="$(thread_doc)"; [ -f "$b.md" ] || { rm -f "$b.json"; return 0; }
+  mkdir -p "$BYTHREAD/consumed"; mv "$b.md" "$BYTHREAD/consumed/$(basename "$b")-$(now).md"; rm -f "$b.json"
+  log by-thread "dropped staged doc of thread $T3TID (${1:-consumed})"
+}
+
+# Publish <file> [sid] as this process's handoff: current.md (imported by CLAUDE.md) + by-pid copy + owner marker
+# (+ by-thread copy under T3 Code, see above; sid = the session whose handoff it is).
 publish() {
-  local f="$1"; [ -s "$f" ] || return 1
+  local f="$1" sid="${2:-}"; [ -s "$f" ] || return 1
   cp "$f" "$HANDOFF_DIR/by-pid/$CPID.md"; cp "$f" "$CURRENT"; echo "$CPID" > "$OWNER"
-  log publish "pid=$CPID <- $f"
+  if [ -n "$T3TID" ]; then
+    local b; b="$(thread_doc)"; mkdir -p "$BYTHREAD"; cp "$f" "$b.md"
+    jq -nc --arg sid "$sid" --arg key "$( [ -n "$sid" ] && session_key "$sid")" --arg pid "$CPID" --arg doc "$f" --arg at "$(date -Iseconds)" \
+      '{sid:$sid, key:$key, pid:$pid, doc:$doc, at:$at}' > "$b.json"
+  fi
+  log publish "pid=$CPID <- $f${T3TID:+ (+ by-thread $T3TID)}"
 }
 reset_current() { printf '# Handoff\n(none)\n' > "$CURRENT"; rm -f "$OWNER"; log reset "pid=$CPID"; }
 owner_pid() { cat "$OWNER" 2>/dev/null || echo ""; }

@@ -1,20 +1,26 @@
 #!/bin/bash
 # T3 Code layer (opt-in: T3_AUTOCLEAR=true). The base plugin works anywhere: hooks write and stage the handoff and
-# the user types /clear + /handoff:resume. Under T3 Code this helper drives the same /clear + /handoff:resume with
-# t3ctl, inside the same thread, and keeps T3's view of the thread pointed at the live Claude session:
+# the user types /clear + /handoff:resume. Under T3 Code this helper drives the handoff with t3ctl, inside the same
+# thread, and keeps T3's view of the thread pointed at the live Claude session. Two flows, picked in the preflight:
+#   fresh  (T3 Code >= 0.1.9, server capability freshContext): one "/handoff:resume" sent with `t3ctl threads send
+#          --fresh`. T3 starts a new Claude session (new process, SessionStart(startup)) in the same thread and records
+#          its id itself: no alias, no stale resume. The new session adopts the doc staged for the thread
+#          (by-thread/<thread>.md, see publish in handoff-lib.sh).
+#   clear  (older T3, or HANDOFF_T3_FRESH=false): "/clear" + "/handoff:resume" as plain text, with the alias below.
 #
 #   check [sid]            preflight (+ thread resolution with a sid); prints "ok: …" or the reason, exit 0/1.
 #   nudge <file>           send the handoff-writing request to this thread as its OWN turn (T3 shows only a turn's
 #                          last assistant message; an in-turn nudge would hide the real reply behind "Worked for …").
-#   clear <doc>            once the handoff is staged: when the thread is idle, send "/clear", wait for the new
-#                          session (SessionStart(clear) + alias), then send "/handoff:resume".
+#   clear <doc>            once the handoff is staged: when the thread is idle, fresh flow: send "/handoff:resume" in
+#                          a fresh session and wait for it to adopt the doc; clear flow: send "/clear", wait for the
+#                          new session (SessionStart(clear) + alias), then send "/handoff:resume".
 #   alias <old sid>        (SessionStart(clear), sid = the new session) point the Claude session id T3 resumes for
 #                          this thread at the new session's transcript (see below). Local only: db + files.
 #   recover <prompt-file>  (UserPromptSubmit of a tombstoned session that T3 resumed: a /clear before 0.6 or a
 #                          failed alias) stage the newest handoff of its /clear chain with a digest of the later
-#                          transcripts inlined, then /clear + /handoff:resume as above with the prompt.
+#                          transcripts inlined, then the handoff as above (fresh or /clear) with the prompt.
 #
-# The alias. T3 Code (Beta) 0.1.x records a thread's Claude session id once (statev2.sqlite,
+# The alias (clear flow only). T3 Code (Beta) 0.1.x records a thread's Claude session id once (statev2.sqlite,
 # payload_json.nativeThreadRef.nativeId = R) and ignores the new id a /clear mints; whenever it respawns the process
 # (idle reap, app restart) it runs `resume: R`. So after each /clear, R's transcript <R>.jsonl becomes a symlink to
 # the new session's transcript (the original is kept as <R>.jsonl.pre-handoff): a respawn loads the live context,
@@ -31,9 +37,10 @@
 # (nativeThreadRef.nativeId), via the alias map, or via our /clear tombstone chain; the thread's workspace is this
 # project dir; the mapping is re-checked right before every send.
 # Usage: t3.sh <project root> <hooks.log> <claude session id> <mode> [arg]
+#        HANDOFF_T3_FRESH=false: use the clear flow even where T3 offers fresh sessions.
 #        HANDOFF_T3_DRYRUN=1: resolve and print only. HANDOFF_T3_DB: db path override. HANDOFF_T3_SEND_TIMEOUT (600).
 #        HANDOFF_TRANSCRIPT: transcript path of <session id> (alias, recover). HANDOFF_T3_CLEAR_WAIT: seconds to wait
-#        for the new session after /clear (30).
+#        for the new session after /clear or the fresh send (30).
 
 T3DB="${HANDOFF_T3_DB:-$HOME/.t3/userdata/statev2.sqlite}"
 LEGACY_DB="$HOME/.t3/userdata/state.sqlite"
@@ -63,38 +70,67 @@ SID="${3:-}"; MODE="${4:-}"; ARG="$5"
 say() { echo "$(date +%T) [t3] $*" >> "$LOG"; echo "$*"; }
 logq() { echo "$(date +%T) [t3] $*" >> "$LOG"; }
 
-# ---- background worker: t3.sh <root> <log> <msid> --bg <nudge|clear> <tid> <file> [live sid]
+# ---- background worker: t3.sh <root> <log> <msid> --bg <nudge|clear|fresh> <tid> <file> [live sid]
 # msid = the session id T3 maps the thread to (re-checked before every send); live sid = the session running the
-# hooks. clear: <file> = /handoff:resume arguments (may be empty).
+# hooks. clear/fresh: <file> = /handoff:resume arguments (may be empty).
 if [ "$MODE" = "--bg" ]; then
   BMODE="$5"; TID="$6"; FILE="$7"; LIVE="${8:-$SID}"
   OUTCOME="$HANDOFF_DIR/state/$LIVE.t3clear"
   deadline=$(( $(date +%s) + SEND_TIMEOUT ))
-  # send_when_idle <what> <text-file>: wait for idle, re-check the mapping, send; retry while busy. 0 = sent.
+  WHYNOT=""   # why the last send_when_idle gave up (for the outcome)
+  # send_when_idle <what> <text-file> [t3ctl send flags…]: wait for idle, re-check the mapping, send; retry while
+  # busy (a run, or for --fresh: background agents/commands T3 will not end). 0 = sent.
   send_when_idle() {
-    local out left now
+    local out left now rc what="$1" txt="$2" last=""; shift 2
     while :; do
-      left=$(( deadline - $(date +%s) )); [ "$left" -gt 0 ] || { logq "gave up after ${SEND_TIMEOUT}s: thread $TID never idle long enough ($1)"; return 1; }
+      left=$(( deadline - $(date +%s) ))
+      if [ "$left" -le 0 ]; then
+        WHYNOT="gave up after ${SEND_TIMEOUT}s${last:+, last refusal: $last}"
+        logq "gave up after ${SEND_TIMEOUT}s: thread $TID never accepted $what${last:+ (last refusal: $last)}"; return 1
+      fi
       out="$(t3 threads wait "$TID" --timeout "$left" 2>&1)" || logq "t3ctl threads wait $TID failed (rc=$?): $(printf '%s' "$out" | oneline)"
       now="$(session_of_thread "$TID")"
       if [ -z "$now" ]; then
         if [ -s "$DBERR" ]; then logq "cannot read T3 db $T3DB ($(dberr)); $1 NOT sent"; else logq "thread $TID has no Claude session in the T3 db anymore; $1 NOT sent"; fi
         return 1
       fi
-      [ "$now" = "$SID" ] || { logq "thread $TID now maps to session '$now', not $SID; $1 NOT sent"; return 1; }
-      out="$(t3 threads send "$TID" --stdin < "$2" 2>&1)" && return 0
-      logq "$1 to $TID failed (thread busy?): $(printf '%s' "$out" | oneline); retrying after the next idle"
+      [ "$now" = "$SID" ] || { WHYNOT="thread now maps to session $now"; logq "thread $TID now maps to session '$now', not $SID; $what NOT sent"; return 1; }
+      out="$(t3 threads send "$TID" "$@" --stdin < "$txt" 2>&1)"; rc=$?
+      [ $rc -eq 0 ] && return 0
+      last="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null | oneline)"; [ -n "$last" ] || last="$(printf '%s' "$out" | oneline)"
+      # exit 7 = incompatible server (e.g. --fresh without freshContext): retrying cannot help
+      [ $rc -eq 7 ] && { WHYNOT="T3 refused: $last"; logq "$what to $TID refused (incompatible server): $last"; return 1; }
+      logq "$what to $TID failed (thread busy?): $last; retrying after the next idle"
       sleep 5
     done
   }
   case "$BMODE" in
     nudge)
       send_when_idle "handoff nudge" "$FILE" && logq "sent handoff nudge turn to $TID"; exit 0 ;;
+    fresh)
+      AUTO="$HANDOFF_DIR/state/t3-fresh/$(printf '%s' "$TID" | tr '/' '_')"
+      fail() { rm -f "$AUTO"; echo "failed:$1" > "$OUTCOME"; logq "handoff of $TID failed: $1; type /clear, then /handoff:resume"; exit 0; }
+      Rf="$HANDOFF_DIR/state/$LIVE.resume-cmd.txt"
+      { printf '/handoff:resume'; [ -s "$FILE" ] && { printf ' '; cat "$FILE"; }; } > "$Rf"
+      # SessionStart(startup) of the fresh session adopts the doc, sees this marker (no "invoke resume" note: the
+      # message is /handoff:resume itself) and writes state/cleared/<live sid> = its session id
+      mkdir -p "$(dirname "$AUTO")"; echo "$LIVE" > "$AUTO"
+      MARK="$HANDOFF_DIR/state/cleared/$LIVE"; rm -f "$MARK"
+      send_when_idle "fresh /handoff:resume" "$Rf" --fresh || fail "/handoff:resume in a fresh session not sent: $WHYNOT"
+      logq "sent /handoff:resume to $TID in a fresh session"
+      i=0; while [ ! -s "$MARK" ] && [ $i -lt $(( ${HANDOFF_T3_CLEAR_WAIT:-30} * 2 )) ]; do sleep 0.5; i=$((i+1)); done
+      [ -s "$MARK" ] || fail "no fresh session adopted the handoff within ${HANDOFF_T3_CLEAR_WAIT:-30}s (see hooks.log)"
+      NEW="$(cat "$MARK")"
+      # T3 records the fresh session's id once Claude reports it: check (best effort, log only)
+      i=0; while [ "$(session_of_thread "$TID")" != "$NEW" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
+      if [ "$(session_of_thread "$TID")" = "$NEW" ]; then logq "T3 records session $NEW for thread $TID"
+      else logq "WARNING: T3 maps thread $TID to '$(session_of_thread "$TID")', not the fresh session $NEW"; fi
+      echo "done:$NEW" > "$OUTCOME"; logq "handoff of $TID to fresh session $NEW complete"; exit 0 ;;
     clear)
       fail() { echo "failed:$1" > "$OUTCOME"; logq "handoff of $TID failed: $1; type /clear, then /handoff:resume"; exit 0; }
       C="$HANDOFF_DIR/state/$LIVE.clear-cmd.txt"; printf '/clear' > "$C"
       MARK="$HANDOFF_DIR/state/cleared/$LIVE"; rm -f "$MARK"
-      send_when_idle "/clear" "$C" || fail "/clear not sent (see hooks.log)"
+      send_when_idle "/clear" "$C" || fail "/clear not sent: $WHYNOT"
       logq "sent /clear to $TID"
       # SessionStart(clear) writes state/cleared/<live sid> = new sid (after the alias step)
       i=0; while [ ! -s "$MARK" ] && [ $i -lt $(( ${HANDOFF_T3_CLEAR_WAIT:-30} * 2 )) ]; do sleep 0.5; i=$((i+1)); done
@@ -104,7 +140,7 @@ if [ "$MODE" = "--bg" ]; then
       else logq "WARNING: session $SID (T3's) is NOT aliased to $NEW (see the alias line above); a T3 respawn would resume the pre-clear context"; fi
       Rf="$HANDOFF_DIR/state/$LIVE.resume-cmd.txt"
       { printf '/handoff:resume'; [ -s "$FILE" ] && { printf ' '; cat "$FILE"; }; } > "$Rf"
-      send_when_idle "/handoff:resume" "$Rf" || fail "/handoff:resume not sent after the /clear"
+      send_when_idle "/handoff:resume" "$Rf" || fail "/handoff:resume not sent after the /clear: $WHYNOT"
       echo "done:$NEW" > "$OUTCOME"; logq "sent /handoff:resume to $TID: handoff to session $NEW complete"; exit 0 ;;
   esac
   exit 0
@@ -155,8 +191,18 @@ if [ "$MODE" != "alias" ]; then
   [ "$(jq -r '.supported' <<<"$ENV" 2>/dev/null)" = "false" ] && skip "T3 Code server $VER is not supported by this t3ctl (update t3ctl or T3 Code)"
   version_ge "$VER" "$MIN_T3" || skip "T3 Code server $VER < $MIN_T3; $NEED"
 fi
+# handoff flow: fresh session where T3 offers it (and this process knows its thread), else /clear + alias
+FLOW=clear; FLOWWHY="no freshContext in T3 Code $VER"
+if [ "$MODE" != "alias" ]; then
+  if [ "$(cfg T3_FRESH true)" != "true" ]; then FLOWWHY="HANDOFF_T3_FRESH=false"
+  elif [ "$(jq -r '.capabilities.freshContext // false' <<<"$ENV" 2>/dev/null)" != "true" ]; then :
+  elif [ -z "$T3TID" ]; then FLOWWHY="T3CODE_THREAD_ID not set in this process"
+  elif ! version_ge "$(t3 --version 2>/dev/null)" 0.8.0; then FLOWWHY="t3ctl $(t3 --version 2>/dev/null) has no send --fresh (needs >= 0.8.0)"
+  else FLOW=fresh; FLOWWHY=""; fi
+fi
+FLOWDESC="handoff via fresh session"; [ "$FLOW" = fresh ] || FLOWDESC="handoff via /clear + alias ($FLOWWHY)"
 
-if [ "$MODE" = "check" ] && [ -z "$SID" ]; then say "ok: T3 Code $VER, $(basename "$T3DB") readable, t3ctl ready"; exit 0; fi
+if [ "$MODE" = "check" ] && [ -z "$SID" ]; then say "ok: T3 Code $VER, $(basename "$T3DB") readable, t3ctl ready; $FLOWDESC"; exit 0; fi
 
 # 2. thread resolution (alias: of the pre-clear session)
 [ -n "$SID" ] || skip "no Claude session id"
@@ -218,7 +264,9 @@ esac
 WT="$(jq -r '.worktreePath // empty' <<<"$TJ")"
 if [ -z "$WT" ]; then PID_="$(jq -r '.projectId // empty' <<<"$TJ")"; WT="$(t3json projects | jq -r --arg p "$PID_" '.[] | select(.id==$p) | .workspaceRoot' 2>/dev/null)"; fi
 [ -n "$WT" ] && [ "$(realdir "$WT")" != "$(realdir "$ROOT")" ] && skip "thread $TID works in $WT, not in this project dir $ROOT"
-[ "$MODE" = "check" ] && { say "ok: T3 Code $VER; session $SID -> thread $TID ($ST, matched by $HOW)"; exit 0; }
+# the fresh session finds the doc by this process's T3 thread: it must be the thread resolved here
+if [ "$FLOW" = fresh ] && [ "$T3TID" != "$TID" ]; then FLOW=clear; FLOWWHY="this process's T3CODE_THREAD_ID $T3TID is not thread $TID"; FLOWDESC="handoff via /clear + alias ($FLOWWHY)"; fi
+[ "$MODE" = "check" ] && { say "ok: T3 Code $VER; session $SID -> thread $TID ($ST, matched by $HOW); $FLOWDESC"; exit 0; }
 
 bg() { nohup bash "$0" "$ROOT" "$LOG" "$MSID" --bg "$@" >/dev/null 2>&1 & disown 2>/dev/null || true; }
 
@@ -229,15 +277,17 @@ case "$MODE" in
     bg nudge "$TID" "$ARG" ;;
 
   clear)
-    say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID)"
+    if [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
+    else say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID; $FLOWWHY)"; fi
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
     echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"
-    bg clear "$TID" "" "$SID" ;;
+    bg "$FLOW" "$TID" "" "$SID" ;;
 
   recover)
     # Tombstoned session resumed by T3: chain SID -> continued_by -> … -> tail. Stage the newest handoff doc of the
     # chain, with a digest of everything the later sessions said after it inlined, as THIS session's handoff, then
-    # /clear + /handoff:resume (the /clear aliases T3's session to the fresh one).
+    # the handoff: fresh flow (T3 then records the fresh session) or /clear (which aliases T3's session to the fresh
+    # one) + /handoff:resume.
     CHAIN=("$SID"); cur="$SID"; i=0
     while [ $i -lt 20 ]; do nx="$(tombstone_get "$cur" continued_by)"; [ -n "$nx" ] || break; CHAIN+=("$nx"); cur="$nx"; i=$((i+1)); done
     TAIL="${CHAIN[${#CHAIN[@]}-1]}"
@@ -268,12 +318,13 @@ case "$MODE" in
       # inlined (not just referenced): a resumed model does not reliably open a second file. Capped; full copy in $DIG
       printf '\n## Transcript after this handoff (digest, newest last; full copy: %s)\n\n' "$DIG"
       sed '1,/^Sessions (oldest first)/d' "$DIG" | tail -n 120; } > "$REC.tmp" && mv "$REC.tmp" "$REC"
-    publish "$REC"
+    publish "$REC" "$SID"
     A="$HANDOFF_DIR/state/$SID.resume-args.txt"
     { printf 'This thread was just recovered by the handoff plugin: the earlier "STOP — stale session resume" note no longer applies. Before the Next steps, handle this message the user sent while the recovery ran:\n\n'; cat "$ARG"; } > "$A"
     echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"
-    say "recovering thread $TID from ${DOC:-no doc} + digest $DIG (/clear, then /handoff:resume with the user's message)"
-    bg clear "$TID" "$A" "$SID"
+    if [ "$FLOW" = fresh ]; then say "recovering thread $TID from ${DOC:-no doc} + digest $DIG (/handoff:resume with the user's message, in a fresh session)"
+    else say "recovering thread $TID from ${DOC:-no doc} + digest $DIG (/clear, then /handoff:resume with the user's message)"; fi
+    bg "$FLOW" "$TID" "$A" "$SID"
     echo "RECOVERING" ;;
 esac
 exit 0

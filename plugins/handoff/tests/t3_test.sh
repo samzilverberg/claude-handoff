@@ -12,6 +12,7 @@ bad() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${2:-}" ] && printf '
 TMP="$(mktemp -d)"; trap 'pkill -f "t3.sh $TMP" 2>/dev/null; rm -rf "$TMP"' EXIT
 export CLAUDE_PROJECT_DIR="$TMP"
 export CLAUDE_HANDOFF_NESTED=""
+unset T3CODE_THREAD_ID   # set per case: T3 Code exports it to its agent processes (and this suite may run inside T3)
 export HANDOFF_THRESHOLD=1000 HANDOFF_LIVE_FROM=0
 export HANDOFF_T3_AUTOCLEAR=true
 export __CFBundleIdentifier=com.t3tools.t3code      # host guard: pretend T3 Code spawned us
@@ -25,20 +26,37 @@ HD="$TMP/.claude/handoff"; LOG="$HD/hooks.log"
 # $T3_FAKE_WT), missing when X = $T3_FAKE_MISSING. `threads send` fails while $T3_FAKE_BUSY exists. A "/clear" send
 # plays Claude Code's /clear in the thread's process: SessionEnd(clear) of the live session ($T3_FAKE_LIVE, else the
 # session the db maps the thread to), then SessionStart(clear) of a new session CLRn with transcript $T3_FAKE_TX/CLRn.jsonl
-# (skipped when $T3_FAKE_NOCLEAR is set).
+# (skipped when $T3_FAKE_NOCLEAR is set). `env` advertises capabilities.freshContext when $T3_FAKE_FRESH is set;
+# `--version` prints $T3_FAKE_CTL_VERSION (0.8.0). A `threads send --fresh` plays T3's fresh session (seen live on
+# 0.1.9): exit 7 when $T3_FAKE_FRESH_RC7 is set; refused while $T3_FAKE_FRESH_REJECT exists (background work); else the
+# old process (it owns current.md) ends with SessionEnd(other), a new process starts SessionStart(startup) of FRSn with
+# T3CODE_THREAD_ID=<thread> (stdout to $T3_FAKE_TX/FRSn.ss, its pid to .ss.pid), and T3 records FRSn for the thread.
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/t3ctl" <<'EOF2'
 #!/bin/bash
 echo "$*" >> "$T3_FAKE_LOG"
 case "$1 $2" in
   "env ") [ -n "$T3_FAKE_VERSION" ] || { echo '{"error":{"code":"no_server"}}'; exit 3; }
-          echo "{\"serverVersion\":\"$T3_FAKE_VERSION\",\"supported\":true}"; exit 0;;
+          caps=""; [ -n "$T3_FAKE_FRESH" ] && caps=',"capabilities":{"freshContext":true}'
+          echo "{\"serverVersion\":\"$T3_FAKE_VERSION\",\"supported\":true$caps}"; exit 0;;
+  "--version ") echo "${T3_FAKE_CTL_VERSION-0.8.0}"; exit 0;;
   "projects ") echo "[{\"id\":\"P1\",\"workspaceRoot\":\"$T3_FAKE_ROOT\"}]"; exit 0;;
   "threads list") id="${4:-}"; st=idle; [ "$id" = "${T3_FAKE_MISSING:-}" ] && st=missing
                   echo "[{\"id\":\"$id\",\"status\":\"$st\",\"title\":\"Title of $id\",\"projectId\":\"P1\",\"worktreePath\":\"${T3_FAKE_WT:-$T3_FAKE_ROOT}\"}]"; exit 0;;
   "threads wait") exit 0;;
   "threads send") [ -e "$T3_FAKE_BUSY" ] && { echo "thread is running" >&2; exit 1; }
+                  case " $* " in *" --fresh "*)
+                    [ -n "$T3_FAKE_FRESH_RC7" ] && { echo '{"error":{"code":"incompatible_server","message":"this T3 Code does not support fresh sessions"}}'; exit 7; }
+                    [ -e "$T3_FAKE_FRESH_REJECT" ] && { echo '{"error":{"code":"orchestration_error","message":"The current session is still running background agents or commands, and a fresh session would end them."}}'; exit 1; };; esac
                   case " $* " in *" --stdin "*) cat > "$T3_FAKE_LOG.stdin"; { cat "$T3_FAKE_LOG.stdin"; echo; echo "--"; } >> "$T3_FAKE_LOG.sent";; esac
+                  case " $* " in *" --fresh "*)
+                    tid="$3"; live="$(cat "$T3_FAKE_LIVE" 2>/dev/null)"
+                    [ -n "$live" ] || live="$(sqlite3 "$HANDOFF_T3_DB" "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from orchestration_v2_projection_provider_threads where thread_id='$tid' order by updated_at desc limit 1")"
+                    bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$1"; printf "%s" "$2" | bash "$3" >/dev/null' _ "$T3_FAKE_ROOT/.claude/handoff/current.owner" "{\"reason\":\"other\",\"session_id\":\"$live\",\"transcript_path\":\"$T3_FAKE_TX/$live.jsonl\"}" "$T3_FAKE_SCR/handoff-sessionend.sh"
+                    n=$(( $(cat "$T3_FAKE_TX/.f" 2>/dev/null || echo 0) + 1 )); echo $n > "$T3_FAKE_TX/.f"; new="FRS$n"; : > "$T3_FAKE_TX/$new.jsonl"
+                    T3CODE_THREAD_ID="$tid" bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$3.pid"; printf "%s" "$1" | bash "$2" > "$3"' _ "{\"source\":\"startup\",\"session_id\":\"$new\",\"transcript_path\":\"$T3_FAKE_TX/$new.jsonl\"}" "$T3_FAKE_SCR/handoff-sessionstart.sh" "$T3_FAKE_TX/$new.ss"
+                    sqlite3 "$HANDOFF_T3_DB" "insert into orchestration_v2_projection_provider_threads values('$tid','2026-11-12T00:00:$(printf %02d $n)Z','{\"nativeThreadRef\":{\"nativeId\":\"$new\"}}')"
+                    echo "$new" > "$T3_FAKE_LIVE"; exit 0;; esac
                   if [ "$(cat "$T3_FAKE_LOG.stdin" 2>/dev/null)" = "/clear" ] && [ -z "$T3_FAKE_NOCLEAR" ]; then
                     live="$(cat "$T3_FAKE_LIVE" 2>/dev/null)"
                     [ -n "$live" ] || live="$(sqlite3 "$HANDOFF_T3_DB" "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from orchestration_v2_projection_provider_threads where thread_id='$3' order by updated_at desc limit 1")"
@@ -51,6 +69,9 @@ esac
 exit 0
 EOF2
 chmod +x "$TMP/bin/t3ctl"; export PATH="$TMP/bin:$PATH"
+# cpid.sh: prints the CPID a hook started by the same parent computes (claude_pid walks up to a `claude` executable;
+# when this suite runs inside Claude Code that is the outer claude, not the parent shell)
+printf '#!/bin/bash\nsource "$T3_FAKE_SCR/handoff-lib.sh"; echo "$CPID"\n' > "$TMP/bin/cpid.sh"
 
 # T3 Code (Beta) >= 0.1.0 state db: thread <-> Claude session via payload_json.nativeThreadRef.nativeId
 V2T=orchestration_v2_projection_provider_threads
@@ -241,6 +262,128 @@ N="$(cat "$T3_FAKE_LIVE")"
 grep -q "^/handoff:resume This thread was just recovered" "$T3_FAKE_LOG.sent" && grep -q "status?" "$T3_FAKE_LOG.sent" && ok "L: /handoff:resume carries the user's message" || bad "L: resume args" "$(cat "$T3_FAKE_LOG.sent")"
 OUT="$(hook handoff-userprompt.sh '{"session_id":"V2A","prompt":"again"}')"
 [ -z "$OUT" ] && ok "L: a later respawn under V2A runs normally" || bad "L: second prompt" "$OUT"
+
+# =====================================================================================================================
+# 0.7: T3 Code >= 0.1.9 fresh sessions (freshContext). Same thread, new process: SessionEnd(other) of the old one,
+# SessionStart(startup) of the new one; T3 records the new session id itself.
+export T3_FAKE_FRESH=1
+own() { cat "$HD/current.owner" 2>/dev/null; }
+
+# --- M. preflight picks the flow and names why it falls back -------------------------------------------------------
+v2row THREADF SIDF
+R="$(T3CODE_THREAD_ID=THREADF chk SIDF check)"; case "$R" in *"thread THREADF"*"; handoff via fresh session") ok "M: freshContext + thread env -> fresh flow";; *) bad "M: fresh check" "$R";; esac
+R="$(T3CODE_THREAD_ID=THREADF chk "" check)"; case "$R" in *"; handoff via fresh session") ok "M: sid-less check names the flow";; *) bad "M: sid-less" "$R";; esac
+R="$(T3_FAKE_FRESH= T3CODE_THREAD_ID=THREADF chk SIDF check)"; case "$R" in *"handoff via /clear + alias (no freshContext in T3 Code 0.1.2)") ok "M: no capability -> /clear flow, reason named";; *) bad "M: no cap" "$R";; esac
+R="$(chk SIDF check)"; case "$R" in *"/clear + alias (T3CODE_THREAD_ID not set in this process)") ok "M: no thread env -> /clear flow";; *) bad "M: no env" "$R";; esac
+R="$(T3CODE_THREAD_ID=THREAD1 chk SIDF check)"; case "$R" in *"/clear + alias (this process's T3CODE_THREAD_ID THREAD1 is not thread THREADF)") ok "M: thread env of another thread -> /clear flow";; *) bad "M: env mismatch" "$R";; esac
+R="$(HANDOFF_T3_FRESH=false T3CODE_THREAD_ID=THREADF chk SIDF check)"; case "$R" in *"/clear + alias (HANDOFF_T3_FRESH=false)") ok "M: HANDOFF_T3_FRESH=false -> /clear flow";; *) bad "M: knob" "$R";; esac
+R="$(T3_FAKE_CTL_VERSION=0.7.1 T3CODE_THREAD_ID=THREADF chk SIDF check)"; case "$R" in *"/clear + alias (t3ctl 0.7.1 has no send --fresh (needs >= 0.8.0))") ok "M: old t3ctl -> /clear flow";; *) bad "M: old t3ctl" "$R";; esac
+
+# --- N. automatic handoff in a fresh session ------------------------------------------------------------------------
+export T3CODE_THREAD_ID=THREADF
+reset_fake; full_doc "$HD/sessions/SIDF.md"; state_set SIDF final_written_ctx 5000; echo '{"orig":"SIDF"}' > "$TMP/tx/SIDF.jsonl"
+OUT="$(hook handoff-stop.sh "$(stop_in SIDF)")"
+echo "$OUT" | grep -q "sends /handoff:resume to this thread in a fresh session" && ok "N: Stop says fresh session" || bad "N: Stop message" "$OUT"
+wait_for "handoff of THREADF to fresh session FRS1 complete" "$LOG" && ok "N: fresh handoff done" || bad "N: flow" "$(grep '\[t3\]' "$LOG" | tail -5)"
+grep -q "threads send THREADF --fresh --stdin" "$T3_FAKE_LOG" && [ "$(cat "$T3_FAKE_LOG.sent")" = "$(printf '/handoff:resume\n--')" ] && ok "N: exactly one send: /handoff:resume with --fresh" || bad "N: sends" "$(cat "$T3_FAKE_LOG" "$T3_FAKE_LOG.sent")"
+[ ! -L "$TMP/tx/SIDF.jsonl" ] && [ ! -e "$TMP/tx/SIDF.jsonl.pre-handoff" ] && [ ! -e "$HD/state/aliased-by/FRS1" ] && ok "N: no alias, no symlink" || bad "N: alias made" "$(ls -la "$TMP/tx" | grep SIDF)"
+grep -q "T3 records session FRS1 for thread THREADF" "$LOG" && ok "N: T3's record checked = the fresh session" || bad "N: record" "$(grep '\[t3\]' "$LOG" | tail -3)"
+NP="$(cat "$TMP/tx/FRS1.ss.pid")"
+[ "$(own)" = "$NP" ] && cmp -s "$HD/by-pid/$NP.md" "$HD/sessions/SIDF.md" && cmp -s "$HD/current.md" "$HD/sessions/SIDF.md" && ok "N: fresh session adopted the doc (by-pid/<new pid>, current.md, owner)" || bad "N: adopt" "owner=$(own) np=$NP $(head -2 "$HD/current.md")"
+grep -q "adopted the handoff staged for T3 thread THREADF (from session SIDF)" "$LOG" && ok "N: adoption logged" || bad "N: adopt log"
+[ ! -s "$TMP/tx/FRS1.ss" ] && ok "N: no 'invoke resume' note on the automatic path (its message is /handoff:resume)" || bad "N: note" "$(cat "$TMP/tx/FRS1.ss")"
+[ ! -e "$HD/by-thread/THREADF.md" ] && ls "$HD/by-thread/consumed/" | grep -q '^THREADF-' && [ ! -e "$HD/state/t3-fresh/THREADF" ] && ok "N: per-thread doc consumed, marker gone" || bad "N: consume" "$(ls -R "$HD/by-thread" "$HD/state/t3-fresh" 2>&1)"
+is_tombstoned SIDF && [ "$(tombstone_get SIDF continued_by)" = "FRS1" ] && ok "N: old session tombstoned -> FRS1" || bad "N: tombstone" "$(cat "$HD/state/tombstones/SIDF.json" 2>/dev/null)"
+[ "$(session_key FRS1)" = "FRS1" ] && ok "N: fresh session keyed by its own id" || bad "N: key" "$(session_key FRS1)"
+[ "$(cat "$HD/state/SIDF.t3clear")" = "done:FRS1" ] && ok "N: outcome done" || bad "N: outcome" "$(cat "$HD/state/SIDF.t3clear")"
+# next window in FRS1: resolved by its own session id, nudged for sessions/FRS1.md
+reset_fake; echo FRS1 > "$T3_FAKE_LIVE"
+OUT="$(hook handoff-stop.sh "$(stop_in FRS1)")"
+wait_for "threads send THREADF --stdin" "$T3_FAKE_LOG" && grep -q "Write the handoff document with the Write tool to $HD/sessions/FRS1.md" "$T3_FAKE_LOG.stdin" && ok "N: next window nudges for sessions/FRS1.md" || bad "N: next window" "$OUT"
+grep -q "nudge scheduled for thread THREADF (matched by session id, session FRS1)" "$LOG" && ok "N: fresh session resolved by its own id" || bad "N: resolve" "$(grep '\[t3\]' "$LOG" | tail -2)"
+# T3 respawns the thread: --resume FRS1 (live), a resume of SIDF would be the stale one
+OUT="$(hook handoff-sessionstart.sh '{"source":"resume","session_id":"FRS1"}')"; echo "$OUT" | grep -q STOP && bad "N: respawn of FRS1 is live" "$OUT" || ok "N: respawn of the fresh session is live"
+OUT="$(hook handoff-sessionstart.sh '{"source":"resume","session_id":"SIDF"}')"; echo "$OUT" | grep -q "STOP.*claude --resume FRS1" && ok "N: resume of the old session is stopped, names FRS1" || bad "N: zombie" "$OUT"
+# second handoff, from FRS1: FRS2, tombstone chain SIDF -> FRS1 -> FRS2
+reset_fake; echo FRS1 > "$T3_FAKE_LIVE"; full_doc "$HD/sessions/FRS1.md"; state_set FRS1 final_written_ctx 5000
+hook handoff-stop.sh "$(stop_in FRS1)" >/dev/null
+wait_for "handoff of THREADF to fresh session FRS2 complete" "$LOG" && [ "$(chain_tail SIDF)" = "FRS2" ] && ok "N: second fresh handoff, chain SIDF -> FRS1 -> FRS2" || bad "N: second" "$(grep '\[t3\]' "$LOG" | tail -3)"
+
+# --- O. fresh send refused while background work runs: retried, then named ---------------------------------------
+v2row THREADG SIDG; export T3CODE_THREAD_ID=THREADG
+reset_fake; rm -f "$T3_FAKE_LIVE"; touch "$TMP/freject"; export T3_FAKE_FRESH_REJECT="$TMP/freject"
+full_doc "$HD/sessions/SIDG.md"; state_set SIDG final_written_ctx 5000
+hook handoff-stop.sh "$(stop_in SIDG)" >/dev/null
+wait_for "fresh /handoff:resume to THREADG failed (thread busy?): The current session is still running background agents" "$LOG" 8 && ok "O: background-work refusal logged, retrying" || bad "O: retry" "$(grep '\[t3\]' "$LOG" | tail -3)"
+rm -f "$TMP/freject"
+wait_for "handoff of THREADG to fresh session" "$LOG" 15 && ok "O: sent once the background work ended" || bad "O: never sent" "$(grep '\[t3\]' "$LOG" | tail -3)"
+# refusal that never ends: outcome names it, marker removed, later Stop reports it
+v2row THREADH2 SIDH2; export T3CODE_THREAD_ID=THREADH2
+reset_fake; rm -f "$T3_FAKE_LIVE"; touch "$TMP/freject"
+full_doc "$HD/sessions/SIDH2.md"; state_set SIDH2 final_written_ctx 5000
+HANDOFF_T3_SEND_TIMEOUT=3 hook handoff-stop.sh "$(stop_in SIDH2)" >/dev/null
+wait_for "handoff of THREADH2 failed: /handoff:resume in a fresh session not sent: gave up after 3s, last refusal: The current session is still running background agents" "$LOG" 12 && ok "O: persistent refusal -> named failure" || bad "O: giveup" "$(grep '\[t3\]' "$LOG" | tail -3)"
+[ ! -e "$HD/state/t3-fresh/THREADH2" ] && ok "O: auto marker removed on failure" || bad "O: marker left"
+OUT="$(hook handoff-stop.sh "$(stop_in SIDH2)")"; echo "$OUT" | grep -q "automatic T3 handoff failed (/handoff:resume in a fresh session not sent: gave up" && ok "O: next Stop reports it + manual path" || bad "O: report" "$OUT"
+rm -f "$TMP/freject"; unset T3_FAKE_FRESH_REJECT
+# exit 7 (incompatible) is not retried
+v2row THREADI7 SIDI7; export T3CODE_THREAD_ID=THREADI7; reset_fake; rm -f "$T3_FAKE_LIVE"
+full_doc "$HD/sessions/SIDI7.md"; state_set SIDI7 final_written_ctx 5000
+T3_FAKE_FRESH_RC7=1 hook handoff-stop.sh "$(stop_in SIDI7)" >/dev/null
+wait_for "handoff of THREADI7 failed: /handoff:resume in a fresh session not sent: T3 refused: this T3 Code does not support fresh sessions" "$LOG" 6 && ok "O: incompatible server -> immediate named failure" || bad "O: rc7" "$(grep '\[t3\]' "$LOG" | tail -3)"
+
+# --- P. manual T3 path: composer /clear (arms freshContext) + /handoff:resume, base layer only -----------------------
+export T3CODE_THREAD_ID=THREADM; reset_fake
+full_doc "$HD/sessions/SIDM.md"; echo "manual marker M" >> "$HD/sessions/SIDM.md"; state_set SIDM final_written_ctx 5000
+OUT="$(HANDOFF_T3_AUTOCLEAR=false hook handoff-stop.sh "$(stop_in SIDM)")"
+echo "$OUT" | grep -q "Type /clear, then /handoff:resume" && [ -s "$HD/by-thread/THREADM.md" ] && jq -e '.sid=="SIDM"' "$HD/by-thread/THREADM.json" >/dev/null && ok "P: staged per thread (with the staging session)" || bad "P: stage" "$OUT"
+# T3 detaches the old process: SessionEnd(other) as the owner of current.md -> the 0.6 reset that broke it
+HANDOFF_T3_AUTOCLEAR=false bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$1"; printf "%s" "$2" | bash "$3" >/dev/null' _ "$HD/current.owner" '{"reason":"other","session_id":"SIDM"}' "$SCR/handoff-sessionend.sh"
+grep -q "(none)" "$HD/current.md" && ok "P: (old process reset current.md, as live on 0.1.9)" || bad "P: reset precondition" "$(head -3 "$HD/current.md")"
+OUT="$(HANDOFF_T3_AUTOCLEAR=false bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$1"; printf "%s" "$2" | bash "$3"' _ "$TMP/m.pid" '{"source":"startup","session_id":"NEWM"}' "$SCR/handoff-sessionstart.sh")"
+MP="$(cat "$TMP/m.pid")"
+grep -q "manual marker M" "$HD/by-pid/$MP.md" && grep -q "manual marker M" "$HD/current.md" && [ "$(own)" = "$MP" ] && ok "P: fresh session adopted the doc" || bad "P: adopt" "$(ls "$HD/by-pid") $(head -2 "$HD/current.md")"
+echo "$OUT" | grep -q "invoke the handoff:resume skill" && ok "P: manual path gets the 'invoke resume' note" || bad "P: note" "$OUT"
+is_tombstoned SIDM && [ "$(tombstone_get SIDM continued_by)" = "NEWM" ] && ok "P: old session tombstoned -> NEWM" || bad "P: tombstone"
+# the resume skill's loader: by-pid of its claude process, else the thread's staged doc, else current.md
+LOADER="$(sed -n 's/^!`\(.*\)`$/\1/p' "$DIR/skills/resume/SKILL.md")"
+full_doc "$HD/by-thread/THREADM.md"; echo "loader marker" >> "$HD/by-thread/THREADM.md"
+OUT="$(CLAUDE_PROJECT_DIR="$TMP" bash -c "$LOADER")"; echo "$OUT" | grep -q "loader marker" && ok "P: resume loader falls back to the thread's staged doc" || bad "P: loader" "$OUT"
+rm -f "$HD/by-thread/THREADM.md"
+OUT="$(CLAUDE_PROJECT_DIR="$TMP" bash -c "$LOADER")"; echo "$OUT" | grep -q "manual marker M" && ok "P: …else current.md" || bad "P: loader current" "$OUT"
+# outside T3 (plain CLI) a startup adopts nothing; another thread's startup adopts nothing
+full_doc "$HD/by-thread/THREADM.md"; echo '{"sid":"SIDM2"}' > "$HD/by-thread/THREADM.json"
+OUT="$(env -u T3CODE_THREAD_ID HANDOFF_T3_AUTOCLEAR=false bash "$SCR/handoff-sessionstart.sh" <<<'{"source":"startup","session_id":"CLIX"}')"
+[ -s "$HD/by-thread/THREADM.md" ] && ! echo "$OUT" | grep -q "invoke the handoff" && ok "P: CLI startup adopts nothing" || bad "P: cli" "$OUT"
+OUT="$(T3CODE_THREAD_ID=OTHERT HANDOFF_T3_AUTOCLEAR=false bash "$SCR/handoff-sessionstart.sh" <<<'{"source":"startup","session_id":"OTX"}')"
+[ -s "$HD/by-thread/THREADM.md" ] && ! is_tombstoned SIDM2 && ok "P: other thread's startup adopts nothing" || bad "P: other thread" "$OUT"
+OUT="$(HANDOFF_T3_AUTOCLEAR=false bash "$SCR/handoff-sessionstart.sh" <<<'{"source":"resume","session_id":"RSX"}')"
+[ -s "$HD/by-thread/THREADM.md" ] && ok "P: a resume (respawn) adopts nothing" || bad "P: resume"
+rm -f "$HD/by-thread/THREADM."*
+
+# --- Q. /clear flow (older T3) and compact consume the per-thread doc in-process --------------------------------------
+v2row THREADQ SIDQ; export T3CODE_THREAD_ID=THREADQ; reset_fake; echo '{}' > "$TMP/tx/SIDQ.jsonl"
+full_doc "$HD/sessions/SIDQ.md"; state_set SIDQ final_written_ctx 5000
+OUT="$(T3_FAKE_FRESH= hook handoff-stop.sh "$(stop_in SIDQ)")"
+echo "$OUT" | grep -q "plugin sends /clear and /handoff:resume" && ok "Q: no freshContext -> /clear flow" || bad "Q: flow" "$OUT"
+wait_for "sent /handoff:resume to THREADQ" "$LOG" && [ -L "$TMP/tx/SIDQ.jsonl" ] && ok "Q: /clear + alias as in 0.6" || bad "Q: clear flow" "$(grep '\[t3\]' "$LOG" | tail -3)"
+[ ! -e "$HD/by-thread/THREADQ.md" ] && grep -q "dropped staged doc of thread THREADQ (clear in pid" "$LOG" && ok "Q: SessionStart(clear) drops the per-thread doc" || bad "Q: drop" "$(ls "$HD/by-thread")"
+full_doc "$HD/by-thread/THREADQ.md"
+hook handoff-sessionstart.sh '{"source":"compact","session_id":"SIDQ"}' >/dev/null
+[ ! -e "$HD/by-thread/THREADQ.md" ] && ok "Q: compact drops it too" || bad "Q: compact"
+
+# --- R. recovery of a stale thread uses the fresh flow where available ----------------------------------------------
+v2row THREADR RZ1; export T3CODE_THREAD_ID=THREADR; reset_fake; echo RZ1 > "$T3_FAKE_LIVE"
+tombstone_set RZ1 1 >/dev/null; tombstone_link RZ1 RZ2 >/dev/null; full_doc "$HD/sessions/RZ2.md"; echo '{}' > "$TMP/tx/RZ1.jsonl"
+OUT="$(hook handoff-userprompt.sh "{\"session_id\":\"RZ1\",\"prompt\":\"where are we?\",\"transcript_path\":\"$TMP/tx/RZ1.jsonl\"}")"
+echo "$OUT" | jq -e '.decision=="block"' >/dev/null && ok "R: stale prompt blocked" || bad "R: block" "$OUT"
+grep -q "recovering thread THREADR .*in a fresh session" "$LOG" && ok "R: recovery picks the fresh flow" || bad "R: flow" "$(grep '\[t3\]' "$LOG" | tail -2)"
+wait_for "handoff of THREADR to fresh session" "$LOG" && ok "R: recovered into a fresh session" || bad "R: recover" "$(grep '\[t3\]' "$LOG" | tail -3)"
+N="$(cat "$T3_FAKE_LIVE")"
+grep -q "^/handoff:resume This thread was just recovered" "$T3_FAKE_LOG.sent" && grep -q "where are we?" "$T3_FAKE_LOG.sent" && ! grep -q "^/clear" "$T3_FAKE_LOG.sent" && ok "R: one fresh /handoff:resume carrying the user's message" || bad "R: sends" "$(cat "$T3_FAKE_LOG.sent")"
+[ ! -L "$TMP/tx/RZ1.jsonl" ] && is_tombstoned RZ1 && [ "$(chain_tail RZ1)" = "$N" ] && ok "R: no alias; stale session stays tombstoned, chain ends at $N" || bad "R: state" "$(chain_tail RZ1)"
+grep -q "Recovery note" "$HD/current.md" && ok "R: the fresh session loads the recovery doc" || bad "R: doc" "$(head -3 "$HD/current.md")"
+unset T3CODE_THREAD_ID T3_FAKE_FRESH
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
