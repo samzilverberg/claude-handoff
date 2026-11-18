@@ -6,7 +6,8 @@
 #          --fresh`. T3 starts a new Claude session (new process, SessionStart(startup)) in the same thread and records
 #          its id itself: no alias, no stale resume. The new session adopts the doc staged for the thread
 #          (by-thread/<thread>.md, see publish in handoff-lib.sh).
-#   clear  (older T3, or HANDOFF_T3_FRESH=false): "/clear" + "/handoff:resume" as plain text, with the alias below.
+#   clear  (older T3, or HANDOFF_T3_FRESH=false): "/clear" + "/handoff:resume" as plain text, with the alias below
+#          on T3 < 0.1.10.
 #
 #   check [sid]            preflight (+ thread resolution with a sid); prints "ok: …" or the reason, exit 0/1.
 #   nudge <file>           send the handoff-writing request to this thread as its OWN turn (T3 shows only a turn's
@@ -29,11 +30,15 @@
 # T3 pins no conversation head for the thread (resumeSessionAt would name a message the link hides), <R>.jsonl is in
 # the same transcript dir as the new session (same project), and R is not already the new session (a T3 that follows
 # /clear itself needs no alias).
+# T3 Code >= 0.1.10 (pingdotgg/t3code#35054) follows a Claude-side /clear itself: it records the new session id when
+# Claude reports it (system/init) and the next turn reopens the process on it. There the alias is skipped (asked from
+# the server version: SessionStart(clear) runs before T3 has recorded the new id, so the db cannot tell yet) and a
+# background check logs whether T3 did record it. Without a reachable server the alias is made as before.
 #
 # Requires T3 Code (Beta) >= 0.1.0 (state db ~/.t3/userdata/statev2.sqlite, read-only) and t3ctl. Every failure
 # is logged ([t3] in hooks.log) and printed; nothing is sent or linked then.
 # Guards: host is T3 Code; t3ctl/sqlite3 present; db, table, columns and payload shape as expected; server reachable,
-# supported, >= MIN_T3 (not for alias: local only); thread resolved by exact Claude session id
+# supported, >= MIN_T3 (alias: version only, best effort); thread resolved by exact Claude session id
 # (nativeThreadRef.nativeId), via the alias map, or via our /clear tombstone chain; the thread's workspace is this
 # project dir; the mapping is re-checked right before every send.
 # Usage: t3.sh <project root> <hooks.log> <claude session id> <mode> [arg]
@@ -45,6 +50,7 @@
 T3DB="${HANDOFF_T3_DB:-$HOME/.t3/userdata/statev2.sqlite}"
 LEGACY_DB="$HOME/.t3/userdata/state.sqlite"
 MIN_T3="0.1.0"
+FOLLOWS_CLEAR="0.1.10"   # first T3 Code that records the session a Claude-side /clear starts (#35054)
 SEND_TIMEOUT="${HANDOFF_T3_SEND_TIMEOUT:-600}"
 V2T=orchestration_v2_projection_provider_threads
 NEED="T3 automation needs T3 Code (Beta) >= $MIN_T3 (state db statev2.sqlite)"
@@ -105,6 +111,13 @@ if [ "$MODE" = "--bg" ]; then
     done
   }
   case "$BMODE" in
+    follow)
+      # alias skipped because T3 follows /clear itself: check (log only) that it records the new session $SID
+      i=0; while [ "$(session_of_thread "$TID")" != "$SID" ] && [ $i -lt $(( ${HANDOFF_T3_CLEAR_WAIT:-30} * 2 )) ]; do sleep 0.5; i=$((i+1)); done
+      now="$(session_of_thread "$TID")"
+      if [ "$now" = "$SID" ]; then logq "T3 records the post-/clear session $SID for thread $TID"
+      else logq "WARNING: T3 still maps thread $TID to '$now', not the post-/clear session $SID: a respawn would resume the pre-clear context (no alias was made: T3 Code $FILE)"; fi
+      exit 0 ;;
     nudge)
       send_when_idle "handoff nudge" "$FILE" && logq "sent handoff nudge turn to $TID"; exit 0 ;;
     fresh)
@@ -137,7 +150,12 @@ if [ "$MODE" = "--bg" ]; then
       [ -s "$MARK" ] || fail "no new session observed after /clear"
       NEW="$(cat "$MARK")"
       if [ "$(cat "$HANDOFF_DIR/state/aliases/$SID" 2>/dev/null)" = "$NEW" ]; then logq "session $SID (T3's) now follows $NEW"
-      else logq "WARNING: session $SID (T3's) is NOT aliased to $NEW (see the alias line above); a T3 respawn would resume the pre-clear context"; fi
+      else
+        # T3 >= 0.1.10 records the new session itself, shortly after the /clear: from now on the thread maps to it
+        i=0; while [ "$(session_of_thread "$TID")" != "$NEW" ] && [ $i -lt 20 ]; do sleep 0.5; i=$((i+1)); done
+        if [ "$(session_of_thread "$TID")" = "$NEW" ]; then logq "T3 records session $NEW for thread $TID (it follows /clear)"; SID="$NEW"
+        else logq "WARNING: session $SID (T3's) is NOT aliased to $NEW and T3 did not record $NEW (see the alias line above); a T3 respawn would resume the pre-clear context"; fi
+      fi
       Rf="$HANDOFF_DIR/state/$LIVE.resume-cmd.txt"
       { printf '/handoff:resume'; [ -s "$FILE" ] && { printf ' '; cat "$FILE"; }; } > "$Rf"
       send_when_idle "/handoff:resume" "$Rf" || fail "/handoff:resume not sent after the /clear: $WHYNOT"
@@ -167,6 +185,15 @@ predecessor_of() {
   [ -n "$f" ] && basename "$f" .json
 }
 version_ge() { [ "$(printf '%s\n%s\n' "${2%%-*}" "${1%%-*}" | sort -t. -k1,1n -k2,2n -k3,3n | head -1)" = "${2%%-*}" ]; }
+# t3_follows_clear <server version>: T3 records the session a Claude-side /clear starts (>= FOLLOWS_CLEAR). Pre-releases
+# of 0.1.10 have it from nightly 20261112.4603 on; an older or unrecognised 0.1.10 pre-release counts as without it.
+t3_follows_clear() {
+  local v="$1" base="${1%%-*}" n
+  version_ge "$base" "$FOLLOWS_CLEAR" || return 1
+  [ "$v" = "$base" ] || [ "$base" != "$FOLLOWS_CLEAR" ] && return 0
+  n="$(sed -n 's/^[0-9.]*-nightly\.\([0-9]\{8\}\)\.\([0-9]\{1,\}\).*/\1 \2/p' <<<"$v")"; [ -n "$n" ] || return 1
+  set -- $n; [ "$1" -gt 20261112 ] || { [ "$1" -eq 20261112 ] && [ "$2" -ge 4603 ]; }
+}
 realdir() { (cd "$1" 2>/dev/null && pwd -P); }
 
 # 1. preflight
@@ -190,6 +217,9 @@ if [ "$MODE" != "alias" ]; then
   [ -n "$VER" ] || skip "T3 Code server not reachable via t3ctl within 5 s ($(jq -r '.error.code // .error.message // empty' <<<"$ENV" 2>/dev/null || true)); is T3 Code running?"
   [ "$(jq -r '.supported' <<<"$ENV" 2>/dev/null)" = "false" ] && skip "T3 Code server $VER is not supported by this t3ctl (update t3ctl or T3 Code)"
   version_ge "$VER" "$MIN_T3" || skip "T3 Code server $VER < $MIN_T3; $NEED"
+elif command -v t3ctl >/dev/null 2>&1; then
+  # alias (inside SessionStart's 10 s): only the server version, to skip the alias where T3 follows /clear itself
+  VER="$(t3json env | jq -r '.serverVersion // empty' 2>/dev/null)"; [ -n "$VER" ] || VER="(unreachable)"
 fi
 # handoff flow: fresh session where T3 offers it (and this process knows its thread), else /clear + alias
 FLOW=clear; FLOWWHY="no freshContext in T3 Code $VER"
@@ -206,6 +236,20 @@ if [ "$MODE" = "check" ] && [ -z "$SID" ]; then say "ok: T3 Code $VER, $(basenam
 
 # 2. thread resolution (alias: of the pre-clear session)
 [ -n "$SID" ] || skip "no Claude session id"
+
+# ---- alias where T3 follows /clear itself: nothing to link. Checked before the thread lookup: T3 may already have
+# moved the thread off the pre-clear session. The new session keeps its own id as its key (no aliased-by entry); the
+# pre-clear session stays tombstoned (SessionEnd(clear)) and so does the id it ran under when it was itself aliased.
+if [ "$MODE" = "alias" ] && t3_follows_clear "$VER"; then
+  TID="$(thread_for_session "$SID")"; [ -n "$TID" ] || TID="$(thread_for_session "$ARG")"; [ -n "$TID" ] || TID="$T3TID"
+  K="$(session_key "$ARG")"
+  if [ "$K" != "$ARG" ] && [ "$K" != "$SID" ]; then
+    is_tombstoned "$K" || tombstone_set "$K" "${CPID:-?}" >/dev/null; tombstone_link "$K" "$SID"
+  fi
+  say "T3 Code $VER (>= $FOLLOWS_CLEAR) follows /clear natively; no alias for $ARG -> $SID (thread ${TID:-unknown})"
+  [ -n "$TID" ] && [ -z "$HANDOFF_T3_DRYRUN" ] && { nohup bash "$0" "$ROOT" "$LOG" "$SID" --bg follow "$TID" "$VER" >/dev/null 2>&1 & disown 2>/dev/null || true; }
+  exit 0
+fi
 LOOK="$SID"; [ "$MODE" = "alias" ] && LOOK="$ARG"
 TID="$(thread_for_session "$LOOK")"; HOW="session id"; MSID="$LOOK"
 [ -s "$DBERR" ] && skip "cannot read T3 db $T3DB ($(dberr))"

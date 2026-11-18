@@ -3,9 +3,10 @@
 # that gets a prompt under T3 Code is a thread T3 resumed on its stale pre-/clear session (a /clear by plugin <= 0.5,
 # or one whose alias failed). With T3_AUTOCLEAR the prompt must not run in that stale context (a resumed 300k+
 # session costs a full uncached read and acts on outdated state): block it (zero tokens; T3 shows the reason as a
-# notice) and recover the thread: newest handoff of the /clear chain + transcript digest, /clear (which aliases
-# T3's session to the fresh one), /handoff:resume with the prompt. Outside T3 nothing is blocked: the user picked this session (claude --resume) and the
-# SessionStart note already says where the work continues.
+# notice) and recover the thread: newest handoff of the /clear chain + transcript digest, then /handoff:resume with the
+# prompt in a fresh T3 session (older T3: after a /clear that aliases T3's session to the new one). Outside T3
+# nothing is blocked: the user picked this session (claude --resume) and the SessionStart note already says where the
+# work continues.
 IN="$(cat)"
 SID="$(jq -r .session_id <<<"$IN")"
 # runs on every prompt: answer the common case (live session) before loading the library
@@ -17,7 +18,7 @@ PF="$HANDOFF_DIR/state/$SID.prompt.txt"; jq -r '.prompt // empty' <<<"$IN" > "$P
 [ -s "$PF" ] || exit 0
 R="$(HANDOFF_TRANSCRIPT="$(jq -r '.transcript_path // empty' <<<"$IN")" bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" recover "$PF")"
 if grep -q '^RECOVERING$' <<<"$R"; then
-  jq -nc '{decision:"block", reason:"This thread had resumed a stale Claude session (one an older handoff plugin /cleared in place). The handoff plugin is restoring it: /clear, then /handoff:resume from the latest handoff, with your message. No need to resend it."}'
+  jq -nc '{decision:"block", reason:"This thread had resumed a stale Claude session (one an older handoff plugin /cleared in place). The handoff plugin is restoring it: /handoff:resume from the latest handoff, with your message, in a new session of this thread. No need to resend it."}'
   exit 0
 fi
 # could not recover: let the prompt through, but make sure the model knows it is a stale session

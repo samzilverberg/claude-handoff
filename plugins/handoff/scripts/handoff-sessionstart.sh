@@ -47,6 +47,10 @@ case "$SRC" in
     drop_thread_doc "$SRC in pid $CPID"   # consumed here, in-process: a later fresh session of the thread must not adopt it
     if [ -s "$MINE" ]; then
       cp "$MINE" "$CURRENT"; echo "$CPID" > "$OWNER"; log sessionstart "current.md <- by-pid/$CPID.md"
+      # T3 Code >= 0.1.10 runs the first turn after a Claude-side /clear in a new process (resume of this session):
+      # by-pid does not reach it and this process's exit resets current.md. Keep a copy for this session's next
+      # process (adopted by SessionStart(resume), dropped by the first Stop).
+      [ "$SRC" = "clear" ] && [ -n "$T3TID" ] && { mkdir -p "$HANDOFF_DIR/by-session"; cp "$MINE" "$HANDOFF_DIR/by-session/$SID.md"; }
       # Without the CLAUDE.md import, the handoff is loaded on demand: tell Claude it exists
       # (not when the T3 layer is about to send /handoff:resume itself).
       if [ -z "$T3_RESUMING" ] && ! grep -qs '@.claude/handoff/current.md' "$ROOT/CLAUDE.md" "$ROOT/.claude/CLAUDE.md" 2>/dev/null; then
@@ -73,6 +77,13 @@ case "$SRC" in
       if [ -f "$AUTO" ]; then rm -f "$AUTO"   # the T3 layer's first message here is /handoff:resume itself
       else say_ctx "A handoff document from the previous session of this T3 Code thread is staged (written before the context was cleared). Unless this conversation's first message already loaded it (/handoff:resume), invoke the handoff:resume skill to load it before doing anything else, then continue from its Next steps."; fi
       drop_thread_doc "adopted by $SID"
+    fi
+    # a post-/clear session whose first turn T3 runs in a new process (T3 Code >= 0.1.10): adopt the doc its /clear
+    # staged (see the clear branch above)
+    BS="$HANDOFF_DIR/by-session/$SID.md"
+    if [ "$SRC" = "resume" ] && [ -s "$BS" ]; then
+      mv "$BS" "$HANDOFF_DIR/by-pid/$CPID.md"; cp "$HANDOFF_DIR/by-pid/$CPID.md" "$CURRENT"; echo "$CPID" > "$OWNER"
+      log sessionstart "adopted the handoff staged at the /clear of session $SID (new process before its first turn) -> pid $CPID"
     fi
     O="$(owner_pid)"
     if [ -n "$O" ] && [ "$O" != "$CPID" ] && [ "$(cfg STARTUP ignore)" = "ignore" ]; then

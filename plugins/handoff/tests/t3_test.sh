@@ -31,6 +31,9 @@ HD="$TMP/.claude/handoff"; LOG="$HD/hooks.log"
 # 0.1.9): exit 7 when $T3_FAKE_FRESH_RC7 is set; refused while $T3_FAKE_FRESH_REJECT exists (background work); else the
 # old process (it owns current.md) ends with SessionEnd(other), a new process starts SessionStart(startup) of FRSn with
 # T3CODE_THREAD_ID=<thread> (stdout to $T3_FAKE_TX/FRSn.ss, its pid to .ss.pid), and T3 records FRSn for the thread.
+# $T3_FAKE_FOLLOWS plays T3 >= 0.1.10 (#35054, seen live on 0.1.10): after a /clear's hooks T3 records CLRn for the
+# thread, and the next send first replaces the process: SessionEnd(other) of the old one (owner of current.md), then
+# SessionStart(resume) of CLRn in a new process (stdout to $T3_FAKE_TX/CLRn.rs, its pid to .rs.pid).
 mkdir -p "$TMP/bin"
 cat > "$TMP/bin/t3ctl" <<'EOF2'
 #!/bin/bash
@@ -57,6 +60,13 @@ case "$1 $2" in
                     T3CODE_THREAD_ID="$tid" bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$3.pid"; printf "%s" "$1" | bash "$2" > "$3"' _ "{\"source\":\"startup\",\"session_id\":\"$new\",\"transcript_path\":\"$T3_FAKE_TX/$new.jsonl\"}" "$T3_FAKE_SCR/handoff-sessionstart.sh" "$T3_FAKE_TX/$new.ss"
                     sqlite3 "$HANDOFF_T3_DB" "insert into orchestration_v2_projection_provider_threads values('$tid','2026-11-12T00:00:$(printf %02d $n)Z','{\"nativeThreadRef\":{\"nativeId\":\"$new\"}}')"
                     echo "$new" > "$T3_FAKE_LIVE"; exit 0;; esac
+                  # T3 >= 0.1.10 after a Claude-side /clear: this turn runs in a new process resuming the new session
+                  # (the old one, owner of current.md, ends with SessionEnd(other)); its pid goes to $T3_FAKE_TX/<sid>.rs.pid
+                  if [ -s "$T3_FAKE_TX/.restart" ] && [ "$(cat "$T3_FAKE_LOG.stdin" 2>/dev/null)" != "/clear" ]; then
+                    rs="$(cat "$T3_FAKE_TX/.restart")"; rm -f "$T3_FAKE_TX/.restart"
+                    bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$1"; printf "%s" "$2" | bash "$3" >/dev/null' _ "$T3_FAKE_ROOT/.claude/handoff/current.owner" "{\"reason\":\"other\",\"session_id\":\"$rs\",\"transcript_path\":\"$T3_FAKE_TX/$rs.jsonl\"}" "$T3_FAKE_SCR/handoff-sessionend.sh"
+                    bash -c 'bash "$T3_FAKE_ROOT/bin/cpid.sh" > "$3.pid"; printf "%s" "$1" | bash "$2" > "$3"' _ "{\"source\":\"resume\",\"session_id\":\"$rs\",\"transcript_path\":\"$T3_FAKE_TX/$rs.jsonl\"}" "$T3_FAKE_SCR/handoff-sessionstart.sh" "$T3_FAKE_TX/$rs.rs"
+                  fi
                   if [ "$(cat "$T3_FAKE_LOG.stdin" 2>/dev/null)" = "/clear" ] && [ -z "$T3_FAKE_NOCLEAR" ]; then
                     live="$(cat "$T3_FAKE_LIVE" 2>/dev/null)"
                     [ -n "$live" ] || live="$(sqlite3 "$HANDOFF_T3_DB" "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from orchestration_v2_projection_provider_threads where thread_id='$3' order by updated_at desc limit 1")"
@@ -64,6 +74,11 @@ case "$1 $2" in
                     echo "{\"reason\":\"clear\",\"session_id\":\"$live\",\"transcript_path\":\"$T3_FAKE_TX/$live.jsonl\"}" | bash "$T3_FAKE_SCR/handoff-sessionend.sh" >/dev/null
                     echo "{\"source\":\"clear\",\"session_id\":\"$new\",\"transcript_path\":\"$T3_FAKE_TX/$new.jsonl\"}" | bash "$T3_FAKE_SCR/handoff-sessionstart.sh" >/dev/null
                     echo "$new" > "$T3_FAKE_LIVE"
+                    # T3 >= 0.1.10 (#35054): records the new session once Claude reports it (after the hooks, as seen live)
+                    if [ -n "$T3_FAKE_FOLLOWS" ]; then
+                      sqlite3 "$HANDOFF_T3_DB" "insert into orchestration_v2_projection_provider_threads values('$3','2026-11-18T00:00:$(printf %02d $n)Z','{\"nativeThreadRef\":{\"nativeId\":\"$new\"},\"nativeConversationHeadRef\":null}')"
+                      echo "$new" > "$T3_FAKE_TX/.restart"
+                    fi
                   fi; exit 0;;
 esac
 exit 0
@@ -208,7 +223,7 @@ R="$(al NH1 SIDH)"; case "$R" in *"pins a conversation head"*) ok "I2: pinned co
 [ ! -L "$TMP/tx/SIDH.jsonl" ] && ok "I2: nothing linked when refused" || bad "I2: linked anyway"
 R="$(al SIDA SIDA)"; case "$R" in *"no alias needed"*|*"already records"*) ok "I2: T3 already on the new session -> nothing to do";; *) bad "I2: same id" "$R";; esac
 R="$(HANDOFF_TRANSCRIPT="$TMP/elsewhere/NA1.jsonl" bash "$SCR/t3.sh" "$TMP" "$LOG" NA1 alias SIDA)"; case "$R" in *"not found (thread THREADA runs elsewhere?)"*) ok "I2: other transcript dir -> no alias";; *) bad "I2: other dir" "$R";; esac
-R="$(T3_FAKE_VERSION= al NA1 SIDA)"; case "$R" in *"aliased T3's session SIDA"*) ok "I2: alias needs no T3 server (local only)";; *) bad "I2: local only" "$R";; esac
+R="$(T3_FAKE_VERSION= al NA1 SIDA)"; case "$R" in *"aliased T3's session SIDA"*) ok "I2: no T3 server reachable -> alias as before (local only)";; *) bad "I2: local only" "$R";; esac
 
 # --- J. preflight: each broken moving part is refused with a reason naming it -----------------------------
 chk() { bash "$SCR/t3.sh" "$TMP" "$TMP/j.log" "$@" 2>&1; }
@@ -250,7 +265,7 @@ printf '%s\n' '{"type":"user","timestamp":"2026-10-25T09:00:00Z","message":{"rol
   '{"type":"assistant","timestamp":"2026-10-25T09:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Bumped chart to 1.2.3."}]}}' \
   '{"type":"user","timestamp":"2026-10-25T09:02:00Z","message":{"role":"user","content":"<command-name>/clear</command-name>"}}' > "$TMP/tx/V2C.jsonl"
 OUT="$(hook handoff-userprompt.sh "{\"session_id\":\"V2A\",\"prompt\":\"status?\",\"transcript_path\":\"$TMP/tx/V2A.jsonl\"}")"
-echo "$OUT" | jq -e '.decision=="block" and (.reason|test("/clear, then /handoff:resume"))' >/dev/null && ok "L: zombie prompt blocked with reason" || bad "L: block" "$OUT"
+echo "$OUT" | jq -e '.decision=="block" and (.reason|test("restoring it: /handoff:resume from the latest handoff"))' >/dev/null && ok "L: zombie prompt blocked with reason" || bad "L: block" "$OUT"
 wait_for "sent /handoff:resume to THREADV2" "$LOG" && ok "L: /clear + /handoff:resume sent" || bad "L: flow" "$(tail -5 "$LOG")"
 REC="$(ls "$HD/sessions/archive/"V2A-*.md 2>/dev/null | head -1)"
 grep -q "Recovery note" "$REC" && grep -q "## Goal" "$REC" && grep -q "please also bump the chart" "$REC" && ok "L: recovery handoff = newest chain doc + inlined digest (consumed, archived)" || bad "L: rec doc" "$(ls "$HD/sessions/archive/")"
@@ -384,6 +399,72 @@ grep -q "^/handoff:resume This thread was just recovered" "$T3_FAKE_LOG.sent" &&
 [ ! -L "$TMP/tx/RZ1.jsonl" ] && is_tombstoned RZ1 && [ "$(chain_tail RZ1)" = "$N" ] && ok "R: no alias; stale session stays tombstoned, chain ends at $N" || bad "R: state" "$(chain_tail RZ1)"
 grep -q "Recovery note" "$HD/current.md" && ok "R: the fresh session loads the recovery doc" || bad "R: doc" "$(head -3 "$HD/current.md")"
 unset T3CODE_THREAD_ID T3_FAKE_FRESH
+
+# =====================================================================================================================
+# 0.7.1: T3 Code >= 0.1.10 follows a Claude-side /clear itself (pingdotgg/t3code#35054): no alias there.
+# --- S. version gate of the alias step ------------------------------------------------------------------------------
+gate() {  # gate <server version> -> "noalias" | "alias" (dry run, nothing linked)
+  local R; R="$(T3_FAKE_VERSION="$1" HANDOFF_T3_DRYRUN=1 al NSG SIDSG)"
+  case "$R" in *"follows /clear natively; no alias"*) echo noalias;; *"alias SIDSG -> NSG"*"(dry run)"*) echo alias;; *) echo "?? $R";; esac
+}
+v2row THREADSG SIDSG; echo '{}' > "$TMP/tx/SIDSG.jsonl"; : > "$TMP/tx/NSG.jsonl"
+for c in 0.1.10:noalias 0.1.11:noalias 0.2.0:noalias 1.0.0:noalias 0.1.10-nightly.20261112.4603:noalias 0.1.10-nightly.20261117.10:noalias \
+         0.1.11-nightly.20261120.1:noalias 0.1.9:alias 0.1.2:alias 0.1.10-nightly.20261112.4602:alias 0.1.10-nightly.20261111.9999:alias 0.1.10-rc.1:alias; do
+  v="${c%%:*}"; want="${c##*:}"; got="$(gate "$v")"
+  [ "$got" = "$want" ] && ok "S: T3 $v -> $want" || bad "S: T3 $v -> want $want" "$got"
+done
+[ ! -L "$TMP/tx/SIDSG.jsonl" ] && ok "S: dry runs link nothing" || bad "S: dry run linked"
+# >= 0.1.10: no alias; reason logged; new session keyed by its own id; background check sees T3 record it
+v2row THREADS1 SIDS1; echo '{"orig":"S1"}' > "$TMP/tx/SIDS1.jsonl"; : > "$TMP/tx/NS1.jsonl"
+R="$(T3_FAKE_VERSION=0.1.10 al NS1 SIDS1)"
+case "$R" in *"T3 Code 0.1.10 (>= 0.1.10) follows /clear natively; no alias for SIDS1 -> NS1 (thread THREADS1)"*) ok "S: 0.1.10 -> no alias, reason named";; *) bad "S: 0.1.10 gate" "$R";; esac
+grep -q "follows /clear natively; no alias for SIDS1 -> NS1" "$LOG" && ok "S: reason in hooks.log" || bad "S: log"
+[ ! -L "$TMP/tx/SIDS1.jsonl" ] && [ ! -e "$TMP/tx/SIDS1.jsonl.pre-handoff" ] && [ ! -e "$HD/state/aliased-by/NS1" ] && [ ! -e "$HD/state/aliases/SIDS1" ] && ok "S: no symlink, no alias state" || bad "S: alias made" "$(ls -la "$TMP/tx" | grep SIDS1)"
+[ "$(session_key NS1)" = "NS1" ] && ok "S: new session keyed by its own id" || bad "S: key" "$(session_key NS1)"
+v2row THREADS1 NS1 2026-11-18T00:00:00Z
+wait_for "T3 records the post-/clear session NS1 for thread THREADS1" "$LOG" 8 && ok "S: background check confirms T3 recorded the new session" || bad "S: follow check" "$(grep '\[t3\]' "$LOG" | tail -2)"
+# T3 never records it: warning (no alias made)
+v2row THREADS2 SIDS2; echo '{}' > "$TMP/tx/SIDS2.jsonl"; : > "$TMP/tx/NS2.jsonl"
+T3_FAKE_VERSION=0.1.10 al NS2 SIDS2 >/dev/null
+wait_for "WARNING: T3 still maps thread THREADS2 to 'SIDS2', not the post-/clear session NS2" "$LOG" 10 && ok "S: T3 not recording it is logged as a warning" || bad "S: warn" "$(grep '\[t3\]' "$LOG" | tail -2)"
+# T3 already moved the thread to the new session before the hook looked (no lookup of the old id needed)
+v2row THREADS3 NS3; : > "$TMP/tx/NS3.jsonl"
+R="$(T3_FAKE_VERSION=0.1.10 al NS3 SIDS3)"; case "$R" in *"no alias for SIDS3 -> NS3 (thread THREADS3)"*) ok "S: thread found by the new id when T3 was first";; *) bad "S: T3 first" "$R";; esac
+# pre-clear session that itself ran aliased (key K): K is superseded too
+echo KS4 > "$HD/state/aliased-by/OS4"; : > "$TMP/tx/NS4.jsonl"
+T3_FAKE_VERSION=0.1.10 al NS4 OS4 >/dev/null
+is_tombstoned KS4 && [ "$(tombstone_get KS4 continued_by)" = "NS4" ] && ok "S: the old session's alias key is tombstoned -> NS4" || bad "S: key tombstone" "$(cat "$HD/state/tombstones/KS4.json" 2>/dev/null)"
+# < 0.1.10 still aliases
+v2row THREADS5 SIDS5; echo '{}' > "$TMP/tx/SIDS5.jsonl"; : > "$TMP/tx/NS5.jsonl"
+R="$(T3_FAKE_VERSION=0.1.9 al NS5 SIDS5)"; case "$R" in *"aliased T3's session SIDS5"*) [ -L "$TMP/tx/SIDS5.jsonl" ] && ok "S: 0.1.9 -> alias as before";; *) bad "S: 0.1.9" "$R";; esac
+
+# --- T. /clear flow on T3 >= 0.1.10 (HANDOFF_T3_FRESH=false): no alias, follows T3's new id, survives the process swap --
+export T3_FAKE_VERSION=0.1.10 T3_FAKE_FOLLOWS=1 T3_FAKE_FRESH=1 T3CODE_THREAD_ID=THREADT
+v2row THREADT SIDT; reset_fake; rm -f "$TMP/tx/.restart"; echo '{"orig":"SIDT"}' > "$TMP/tx/SIDT.jsonl"
+full_doc "$HD/sessions/SIDT.md"; echo "T marker" >> "$HD/sessions/SIDT.md"; state_set SIDT final_written_ctx 5000
+OUT="$(HANDOFF_T3_FRESH=false hook handoff-stop.sh "$(stop_in SIDT)")"
+echo "$OUT" | grep -q "plugin sends /clear and /handoff:resume" && ok "T: HANDOFF_T3_FRESH=false -> /clear flow" || bad "T: flow" "$OUT"
+wait_for "sent /handoff:resume to THREADT: handoff to session" "$LOG" 15 && ok "T: /clear + /handoff:resume done" || bad "T: flow" "$(grep '\[t3\]' "$LOG" | tail -5)"
+N="$(cat "$T3_FAKE_LIVE")"
+grep -q "follows /clear natively; no alias for SIDT -> $N (thread THREADT)" "$LOG" && ok "T: alias skipped with the reason" || bad "T: gate log" "$(grep '\[t3\]' "$LOG" | tail -5)"
+grep -q "T3 records session $N for thread THREADT (it follows /clear)" "$LOG" && ! grep -q "THREADT now maps to" "$LOG" && ok "T: worker follows T3's new id (resume not refused)" || bad "T: follow" "$(grep '\[t3\]' "$LOG" | tail -5)"
+[ "$(sed -n 1p "$T3_FAKE_LOG.sent")" = "/clear" ] && [ "$(sed -n 3p "$T3_FAKE_LOG.sent")" = "/handoff:resume" ] && ok "T: sent exactly /clear, then /handoff:resume" || bad "T: sends" "$(cat "$T3_FAKE_LOG.sent")"
+[ ! -L "$TMP/tx/SIDT.jsonl" ] && [ ! -e "$TMP/tx/SIDT.jsonl.pre-handoff" ] && [ ! -e "$HD/state/aliased-by/$N" ] && ok "T: no symlink, no aliased-by" || bad "T: alias" "$(ls -la "$TMP/tx" | grep SIDT)"
+[ "$(session_key "$N")" = "$N" ] && is_tombstoned SIDT && [ "$(tombstone_get SIDT continued_by)" = "$N" ] && ok "T: $N keyed by its own id; SIDT tombstoned -> $N" || bad "T: keys" "$(session_key "$N") $(cat "$HD/state/tombstones/SIDT.json" 2>/dev/null)"
+RP="$(cat "$TMP/tx/$N.rs.pid" 2>/dev/null)"
+[ -n "$RP" ] && grep -q "T marker" "$HD/by-pid/$RP.md" && grep -q "T marker" "$HD/current.md" && [ "$(own)" = "$RP" ] && ok "T: the replacement process adopted the doc (by-pid/<new pid>, current.md, owner)" || bad "T: adopt" "rp=$RP owner=$(own) $(head -2 "$HD/current.md")"
+grep -q "adopted the handoff staged at the /clear of session $N" "$LOG" && [ ! -e "$HD/by-session/$N.md" ] && ok "T: adoption logged, per-session copy consumed" || bad "T: by-session" "$(ls "$HD/by-session" 2>&1)"
+[ "$(cat "$HD/state/SIDT.t3clear")" = "done:$N" ] && ok "T: outcome done" || bad "T: outcome" "$(cat "$HD/state/SIDT.t3clear")"
+# per-session copy: dropped by the first Stop when that turn ran in-process; a resume without one adopts nothing
+mkdir -p "$HD/by-session"; full_doc "$HD/by-session/BSX.md"
+hook handoff-stop.sh "$(stop_in BSX)" >/dev/null; [ ! -e "$HD/by-session/BSX.md" ] && ok "T: first Stop drops the per-session copy" || bad "T: stop drop"
+hook handoff-sessionstart.sh '{"source":"resume","session_id":"BSY"}' >/dev/null
+! grep -q "staged at the /clear of session BSY" "$LOG" && ! grep -qs "T marker" "$HD/current.md" && ok "T: a resume without a per-session copy adopts nothing" || bad "T: resume adopt"
+# outside T3 (no thread env) SessionStart(clear) keeps no per-session copy
+echo "OLDCLI" > "$HD/state/pid-cleared/$(bash "$TMP/bin/cpid.sh")"; full_doc "$HD/by-pid/$(bash "$TMP/bin/cpid.sh").md"
+env -u T3CODE_THREAD_ID HANDOFF_T3_AUTOCLEAR=false bash "$SCR/handoff-sessionstart.sh" <<<'{"source":"clear","session_id":"CLICLR"}' >/dev/null
+[ ! -e "$HD/by-session/CLICLR.md" ] && ok "T: CLI /clear keeps no per-session copy" || bad "T: cli by-session"
+unset T3CODE_THREAD_ID T3_FAKE_FRESH T3_FAKE_FOLLOWS; export T3_FAKE_VERSION=0.1.2
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

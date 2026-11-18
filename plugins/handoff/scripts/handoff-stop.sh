@@ -13,6 +13,7 @@ THR="$(cfg THRESHOLD 300000)"; LIVE_FROM="$(cfg LIVE_FROM 0)"; LIVE_EVERY="$(cfg
 KEY="$(session_key "$SID")"   # = SID, except post-/clear sessions under the T3 layer (see session_key)
 F="$HANDOFF_DIR/sessions/$KEY.md"
 log stop "ctx=$CTX thr=$THR live_from=$LIVE_FROM active=$ACTIVE sid=$SID"
+rm -f "$HANDOFF_DIR/by-session/$SID.md"   # first turn after a /clear done in-process: no later process adopts it
 # A tombstoned session was already /cleared and superseded; a resume of it is a stale zombie.
 # Do not publish (would re-stage stale content) or nudge — stay inert.
 if is_tombstoned "$SID"; then log stop "tombstoned sid=$SID; inert (no publish/nudge)"; exit 0; fi

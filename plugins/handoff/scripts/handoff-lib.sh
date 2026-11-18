@@ -19,7 +19,7 @@ cfg() { local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"; [ -n "$
 # state get/set per session (tiny json)
 state_get() { local f="$HANDOFF_DIR/state/$1.json"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" || true; }
 state_set() { local f="$HANDOFF_DIR/state/$1.json"; local cur='{}'; [ -f "$f" ] && cur="$(cat "$f")"; jq -c --arg k "$2" --arg v "$3" '.[$k]=$v' <<<"$cur" > "$f"; }
-# session_key <sid>: key for per-context-window state and the handoff doc. The T3 layer (t3.sh alias) maps every
+# session_key <sid>: key for per-context-window state and the handoff doc. On T3 < 0.1.10 the T3 layer (t3.sh alias) maps every
 # post-/clear session of a thread to the Claude session id T3 resumes, so both carry over a T3 respawn that comes
 # back under that id. Elsewhere: the sid itself.
 session_key() { local k; k="$(cat "$HANDOFF_DIR/state/aliased-by/$1" 2>/dev/null)"; echo "${k:-$1}"; }
