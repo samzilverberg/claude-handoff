@@ -50,7 +50,8 @@ case "$1 $2" in
   "threads send") [ -e "$T3_FAKE_BUSY" ] && { echo "thread is running" >&2; exit 1; }
                   case " $* " in *" --fresh "*)
                     [ -n "$T3_FAKE_FRESH_RC7" ] && { echo '{"error":{"code":"incompatible_server","message":"this T3 Code does not support fresh sessions"}}'; exit 7; }
-                    [ -e "$T3_FAKE_FRESH_REJECT" ] && { echo '{"error":{"code":"orchestration_error","message":"The current session is still running background agents or commands, and a fresh session would end them."}}'; exit 1; };; esac
+                    # as t3ctl prints it against T3 0.1.10: the reason is nested inside the RPC error's message (seen live)
+                    [ -e "$T3_FAKE_FRESH_REJECT" ] && { echo '{"error":{"code":"rpc_error","message":"orchestration.dispatchCommand failed: [{\"_tag\":\"Fail\",\"error\":{\"_tag\":\"OrchestrationV2DispatchCommandError\",\"commandId\":\"c-1\",\"commandType\":\"message.dispatch\",\"message\":\"The current session is still running background agents or commands, and a fresh session would end them. Wait for them to finish, or press Stop, then send the message again.\",\"detail\":\"The current session is still running background agents or commands, and a fresh session would end them. Wait for them to finish, or press Stop, then se","rpc":"orchestration.dispatchCommand"}}'; echo 't3ctl: orchestration.dispatchCommand failed: [{"_tag":"Fail" …' >&2; exit 1; };; esac
                   case " $* " in *" --stdin "*) cat > "$T3_FAKE_LOG.stdin"; { cat "$T3_FAKE_LOG.stdin"; echo; echo "--"; } >> "$T3_FAKE_LOG.sent";; esac
                   case " $* " in *" --fresh "*)
                     tid="$3"; live="$(cat "$T3_FAKE_LIVE" 2>/dev/null)"
@@ -330,6 +331,11 @@ reset_fake; rm -f "$T3_FAKE_LIVE"; touch "$TMP/freject"; export T3_FAKE_FRESH_RE
 full_doc "$HD/sessions/SIDG.md"; state_set SIDG final_written_ctx 5000
 hook handoff-stop.sh "$(stop_in SIDG)" >/dev/null
 wait_for "fresh /handoff:resume to THREADG failed (thread busy?): The current session is still running background agents" "$LOG" 8 && ok "O: background-work refusal logged, retrying" || bad "O: retry" "$(grep '\[t3\]' "$LOG" | tail -3)"
+wait_for "asked the agent in THREADG to end its background work" "$LOG" 4 && ok "O: agent asked to end its background work" || bad "O: ask" "$(grep '\[t3\]' "$LOG" | tail -3)"
+grep -qx "threads send THREADG --stdin" "$T3_FAKE_LOG" && grep -q "^\[handoff plugin\] The handoff document is written and staged, but T3 Code will not start the fresh session" "$T3_FAKE_LOG.sent" \
+  && ok "O: the ask is a normal turn (no --fresh) naming the blocker" || bad "O: ask send" "$(cat "$T3_FAKE_LOG")"
+i=0; while [ "$(grep -c "fresh /handoff:resume to THREADG failed" "$LOG")" -lt 2 ] && [ $i -lt 40 ]; do sleep 0.25; i=$((i+1)); done
+[ "$(grep -c "asked the agent in THREADG to end its background work" "$LOG")" = 1 ] && [ "$(grep -cx "threads send THREADG --stdin" "$T3_FAKE_LOG")" = 1 ] && ok "O: asked once, not on every refusal" || bad "O: ask once" "$(grep -c "asked the agent" "$LOG")"
 rm -f "$TMP/freject"
 wait_for "handoff of THREADG to fresh session" "$LOG" 15 && ok "O: sent once the background work ended" || bad "O: never sent" "$(grep '\[t3\]' "$LOG" | tail -3)"
 # refusal that never ends: outcome names it, marker removed, later Stop reports it
@@ -339,6 +345,7 @@ full_doc "$HD/sessions/SIDH2.md"; state_set SIDH2 final_written_ctx 5000
 HANDOFF_T3_SEND_TIMEOUT=3 hook handoff-stop.sh "$(stop_in SIDH2)" >/dev/null
 wait_for "handoff of THREADH2 failed: /handoff:resume in a fresh session not sent: gave up after 3s, last refusal: The current session is still running background agents" "$LOG" 12 && ok "O: persistent refusal -> named failure" || bad "O: giveup" "$(grep '\[t3\]' "$LOG" | tail -3)"
 [ ! -e "$HD/state/t3-fresh/THREADH2" ] && ok "O: auto marker removed on failure" || bad "O: marker left"
+grep -q "Stop this session's background agents/commands first: T3 refuses a fresh session (the composer's /clear too)" "$HD/state/SIDH2.t3clear" && ok "O: failure names the fix (stop background work first)" || bad "O: failure hint" "$(cat "$HD/state/SIDH2.t3clear")"
 OUT="$(hook handoff-stop.sh "$(stop_in SIDH2)")"; echo "$OUT" | grep -q "automatic T3 handoff failed (/handoff:resume in a fresh session not sent: gave up" && ok "O: next Stop reports it + manual path" || bad "O: report" "$OUT"
 rm -f "$TMP/freject"; unset T3_FAKE_FRESH_REJECT
 # exit 7 (incompatible) is not retried

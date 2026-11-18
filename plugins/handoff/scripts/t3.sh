@@ -62,6 +62,13 @@ DBERR="$(mktemp -t handoff-t3db)"; trap 'rm -f "$DBERR"' EXIT
 q() { sqlite3 -readonly -cmd ".timeout 2000" "$T3DB" "$1" 2>"$DBERR"; }
 dberr() { head -1 "$DBERR" 2>/dev/null; }
 oneline() { tr -d '\n' | cut -c1-240; }
+# refusal <t3ctl output>: the readable reason of a failed command. T3 0.1.10 wraps it: .error.message is
+# "orchestration.dispatchCommand failed: [{…"message":"<reason>",…}]"; take the inner message when there is one.
+refusal() {
+  local m i; m="$(printf '%s' "$1" | jq -r '.error.message // empty' 2>/dev/null | head -1)"
+  i="$(printf '%s' "$m" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1)"
+  m="${i:-$m}"; [ -n "$m" ] || m="$1"; printf '%s' "$m" | oneline
+}
 # Claude session id T3 has on record for a thread (empty when none or on a db error; see $DBERR)
 session_of_thread() { q "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from $V2T where thread_id='$1' order by updated_at desc limit 1"; }
 thread_json() { t3json threads list -i "$1" | jq -c '.[0] // empty' 2>/dev/null; }
@@ -84,6 +91,16 @@ if [ "$MODE" = "--bg" ]; then
   OUTCOME="$HANDOFF_DIR/state/$LIVE.t3clear"
   deadline=$(( $(date +%s) + SEND_TIMEOUT ))
   WHYNOT=""   # why the last send_when_idle gave up (for the outcome)
+  BGASK=""; BGASKED=0   # fresh flow: ask the agent (once) to end background work T3 refuses a fresh session for
+  BGMARK="background agents or commands"   # T3's refusal text (0.1.9, 0.1.10)
+  # ask_end_background <refusal>: one normal turn (no --fresh) asking the agent to stop background work it no longer
+  # needs; the fresh send is retried after that turn. Up to 3 attempts while the send itself is refused.
+  ask_end_background() {
+    local f="$HANDOFF_DIR/state/$LIVE.bgask.txt" out
+    printf '[handoff plugin] The handoff document is written and staged, but T3 Code will not start the fresh session for it while this session still runs background work (T3: "%s"). Stop the background agents, monitors and commands that are no longer needed (TaskStop; for a background shell, KillShell or kill). If one must finish first, say which one and why in one line and leave it running. Do not start new work. Then end your turn: the plugin retries the fresh session once this thread is idle.\n' "$1" > "$f"
+    out="$(t3 threads send "$TID" --stdin < "$f" 2>&1)" && { BGASKED=3; logq "asked the agent in $TID to end its background work (fresh session refused while it runs)"; return 0; }
+    BGASKED=$((BGASKED+1)); logq "request to end background work not sent to $TID: $(printf '%s' "$out" | oneline)"
+  }
   # send_when_idle <what> <text-file> [t3ctl send flags…]: wait for idle, re-check the mapping, send; retry while
   # busy (a run, or for --fresh: background agents/commands T3 will not end). 0 = sent.
   send_when_idle() {
@@ -103,10 +120,11 @@ if [ "$MODE" = "--bg" ]; then
       [ "$now" = "$SID" ] || { WHYNOT="thread now maps to session $now"; logq "thread $TID now maps to session '$now', not $SID; $what NOT sent"; return 1; }
       out="$(t3 threads send "$TID" "$@" --stdin < "$txt" 2>&1)"; rc=$?
       [ $rc -eq 0 ] && return 0
-      last="$(printf '%s' "$out" | jq -r '.error.message // empty' 2>/dev/null | oneline)"; [ -n "$last" ] || last="$(printf '%s' "$out" | oneline)"
+      last="$(refusal "$out")"
       # exit 7 = incompatible server (e.g. --fresh without freshContext): retrying cannot help
       [ $rc -eq 7 ] && { WHYNOT="T3 refused: $last"; logq "$what to $TID refused (incompatible server): $last"; return 1; }
       logq "$what to $TID failed (thread busy?): $last; retrying after the next idle"
+      case "$out" in *"$BGMARK"*) [ -n "$BGASK" ] && [ "$BGASKED" -lt 3 ] && ask_end_background "$last";; esac
       sleep 5
     done
   }
@@ -129,7 +147,13 @@ if [ "$MODE" = "--bg" ]; then
       # message is /handoff:resume itself) and writes state/cleared/<live sid> = its session id
       mkdir -p "$(dirname "$AUTO")"; echo "$LIVE" > "$AUTO"
       MARK="$HANDOFF_DIR/state/cleared/$LIVE"; rm -f "$MARK"
-      send_when_idle "fresh /handoff:resume" "$Rf" --fresh || fail "/handoff:resume in a fresh session not sent: $WHYNOT"
+      BGASK=1
+      if ! send_when_idle "fresh /handoff:resume" "$Rf" --fresh; then
+        case "$WHYNOT" in
+          *"$BGMARK"*) fail "/handoff:resume in a fresh session not sent: $WHYNOT. Stop this session's background agents/commands first: T3 refuses a fresh session (the composer's /clear too) while they run" ;;
+          *) fail "/handoff:resume in a fresh session not sent: $WHYNOT" ;;
+        esac
+      fi
       logq "sent /handoff:resume to $TID in a fresh session"
       i=0; while [ ! -s "$MARK" ] && [ $i -lt $(( ${HANDOFF_T3_CLEAR_WAIT:-30} * 2 )) ]; do sleep 0.5; i=$((i+1)); done
       [ -s "$MARK" ] || fail "no fresh session adopted the handoff within ${HANDOFF_T3_CLEAR_WAIT:-30}s (see hooks.log)"

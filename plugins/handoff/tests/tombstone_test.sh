@@ -52,10 +52,21 @@ hook handoff-sessionstart.sh "{\"source\":\"clear\",\"session_id\":\"$SID_NEW\"}
 [ "$(tombstone_get "$SID_OLD" continued_by)" = "$SID_NEW" ] && ok "SessionStart(clear) links successor sid" || bad "SessionStart(clear) links successor" "$(tombstone_get "$SID_OLD" continued_by)"
 is_tombstoned "$SID_NEW" && bad "successor must NOT be tombstoned" || ok "successor not tombstoned"
 
+# --- SessionEnd(clear) killed during the nested summarizer (seen live: Claude Code 2.1.327 under T3 0.1.10) ---------
+# the tombstone and the bridge for SessionStart(clear) are written before the summarizer starts
+mkdir -p "$TMP/bin"; printf '#!/bin/bash\nsleep 30\n' > "$TMP/bin/claude"; chmod +x "$TMP/bin/claude"
+rm -f "$HD/state/pid-cleared"/*
+( echo "{\"reason\":\"clear\",\"session_id\":\"sess-KILL\",\"transcript_path\":\"$T\"}" | PATH="$TMP/bin:$PATH" bash "$SCR/handoff-sessionend.sh" >/dev/null 2>&1 ) 2>/dev/null &
+KP=$!; sleep 1.5; { pkill -P "$KP"; pkill -f "$TMP/bin/claude"; kill "$KP"; wait "$KP"; } 2>/dev/null
+[ ! -s "$HD/sessions/sess-KILL.md" ] && ok "killed: (precondition) no handoff doc was written" || bad "killed: doc written"
+is_tombstoned sess-KILL && ok "killed SessionEnd(clear) still tombstoned the session" || bad "killed: no tombstone"
+grep -qsx sess-KILL "$HD/state/pid-cleared"/* && ok "killed SessionEnd(clear) still left the bridge for SessionStart(clear)" || bad "killed: no bridge" "$(ls "$HD/state/pid-cleared")"
+rm -f "$HD/state/pid-cleared"/*
+
 # --- integration: resuming the tombstoned (zombie) sid is told to stop ------
 OUT="$(hook handoff-sessionstart.sh "{\"source\":\"resume\",\"session_id\":\"$SID_OLD\"}")"
 case "$OUT" in *"STOP — stale session resume"*) ok "SessionStart(resume) of zombie injects STOP";; *) bad "zombie stop note" "$OUT";; esac
-case "$OUT" in *"continues in Claude session $SID_NEW (`claude --resume $SID_NEW`"*) ok "stop note names successor + resume command";; *) bad "stop note successor name" "$OUT";; esac
+case "$OUT" in *"continues in Claude session $SID_NEW ("'`claude --resume '"$SID_NEW"'`'*) ok "stop note names successor + resume command";; *) bad "stop note successor name" "$OUT";; esac
 # control: resuming the live successor sid is NOT stopped
 OUT="$(hook handoff-sessionstart.sh "{\"source\":\"resume\",\"session_id\":\"$SID_NEW\"}")"
 case "$OUT" in *"STOP — stale session resume"*) bad "live successor must not be stopped" "$OUT";; *) ok "live successor resume not stopped";; esac

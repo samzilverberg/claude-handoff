@@ -292,3 +292,6 @@ PR #24168 records the id Claude reports after `/clear`. With it, T3's R becomes 
   still aliased there (harmless), and its `/clear` flow broke (resume not sent; doc lost across the process swap).
 - v0.7.1 (2026-11-18): alias only for T3 < 0.1.10 (server version); `/clear` flow follows T3's new id; per-session doc
   copy adopted by the process T3 starts for the first post-clear turn. Verified live on 0.1.10.
+- v0.7.2 (2026-11-18): `SessionEnd(clear)` tombstones and bridges before the summarizer (Claude Code 2.1.327 killed
+  the hook ~1 s into it, which lost the `/clear` chain); a fresh send refused for background work asks the agent once
+  to stop it (the blocker seen in thread dbeea855, reproduced live). Verified live on 0.1.10.
