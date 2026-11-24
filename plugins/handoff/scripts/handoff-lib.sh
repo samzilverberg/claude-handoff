@@ -18,16 +18,17 @@ mkdir -p "$HANDOFF_DIR/sessions" "$HANDOFF_DIR/by-pid" "$HANDOFF_DIR/state" "$HA
 AGENT="${HANDOFF_AGENT:-claude}"
 # Codex plugins have no userConfig: their settings live in a KEY=VALUE file (HANDOFF_CONF, default ~/.codex/handoff.conf).
 HANDOFF_CONF="${HANDOFF_CONF:-${CODEX_HOME:-$HOME/.codex}/handoff.conf}"
-# cfg KEY default -> env HANDOFF_KEY (session override) > plugin userConfig (CLAUDE_PLUGIN_OPTION_KEY; codex: the conf
-# file) > default
+# cfg KEY default -> env HANDOFF_KEY (session override) > per-project KEY=VALUE file (.claude/handoff/handoff.conf;
+# codex: codex.conf first) > plugin userConfig (CLAUDE_PLUGIN_OPTION_KEY; codex: the global conf file) > default
+conf_get() { [ -f "$2" ] && sed -n "s/^[[:space:]]*$1[[:space:]]*=[[:space:]]*//p" "$2" | tail -1 | sed 's/[[:space:]]*\(#.*\)\{0,1\}$//; s/^"\(.*\)"$/\1/'; }
 cfg() {
-  local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"
-  if [ -z "$v" ] && [ "$AGENT" = codex ]; then
-    local f; for f in "$HANDOFF_DIR/codex.conf" "$HANDOFF_CONF"; do   # per project, then global
-      [ -f "$f" ] && v="$(sed -n "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*//p" "$f" | tail -1 | sed 's/[[:space:]]*\(#.*\)\{0,1\}$//; s/^"\(.*\)"$/\1/')"
-      [ -n "$v" ] && break
-    done
-  elif [ -z "$v" ]; then v="$(printenv "CLAUDE_PLUGIN_OPTION_$k" 2>/dev/null)"; fi
+  local k="$1" d="$2" v f; v="$(printenv "HANDOFF_$k" 2>/dev/null)"
+  if [ "$AGENT" = codex ]; then
+    for f in "$HANDOFF_DIR/codex.conf" "$HANDOFF_DIR/handoff.conf" "$HANDOFF_CONF"; do [ -n "$v" ] && break; v="$(conf_get "$k" "$f")"; done
+  else
+    [ -n "$v" ] || v="$(conf_get "$k" "$HANDOFF_DIR/handoff.conf")"
+    [ -n "$v" ] || v="$(printenv "CLAUDE_PLUGIN_OPTION_$k" 2>/dev/null)"
+  fi
   printf '%s' "${v:-$d}"
 }
 # state get/set per session (tiny json)
@@ -253,4 +254,68 @@ tombstone_link() {
   local f cur; f="$(tombstone_file "$1")"; [ -f "$f" ] || return 0
   cur="$(cat "$f")"; jq -c --arg n "$2" '.continued_by=$n' <<<"$cur" > "$f"
   log tombstone "link sid=$1 -> $2"
+}
+
+# --- deferred handoff (T3_DEFER, T3 layer only) ----------------------------------------------------------------------
+# off (default): the handoff runs right after the turn that crosses the threshold. resume: the document is written then,
+# but the fresh session waits for the user's next message. all: nothing at the turn end; the next message starts it
+# (document, then fresh session). Either way the held message is blocked in UserPromptSubmit and re-sent into the fresh
+# session (resume args / inline), so the user reads the last reply undisturbed and the message runs in the new context.
+# Files: state/defer/<sid> = armed kind; state/<sid>.pending-prompt.txt (resume args), .pending-raw.txt (the message);
+# state/<sid>.held = a message was blocked (a Stop right after it is not a real turn end).
+LIBDIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+T3SH="${HANDOFF_T3_SH:-$LIBDIR/t3.sh}"   # tests point this at a stub
+DEFER_DIR="$HANDOFF_DIR/state/defer"
+t3_defer() {
+  [ "$(cfg T3_AUTOCLEAR false)" = "true" ] || { echo off; return; }
+  case "$(cfg T3_DEFER off)" in resume) echo resume;; all) echo all;; *) echo off;; esac
+}
+is_plugin_prompt() { case "$1" in "[handoff plugin]"*|"/handoff:resume"*) return 0;; esac; return 1; }
+# defer_arm <sid> <kind> [request text]: hold the handoff (all) or its fresh session (resume) until the next message.
+# Only when the T3 helper reaches this thread now (else the caller runs the handoff at once). 0 = armed; DEFER_WHY.
+defer_arm() {
+  local R; DEFER_WHY=""
+  R="$(bash "$T3SH" "$ROOT" "$LOG" "$1" check 2>/dev/null)"
+  case "$R" in ok:*) ;; *) DEFER_WHY="${R:-T3 helper check failed}"; log defer "not armed ($2) for sid=$1: $DEFER_WHY"; return 1;; esac
+  mkdir -p "$DEFER_DIR"; echo "$2" > "$DEFER_DIR/$1"
+  [ -n "${3:-}" ] && printf '[handoff plugin] %s\n\n(Sent by the handoff plugin before your held-back message, which then runs in a fresh session of this thread.)\n' "$3" > "$HANDOFF_DIR/state/$1.nudge.txt"
+  log defer "armed $2 for sid=$1"
+}
+is_armed() { [ -f "$DEFER_DIR/$1" ]; }
+# held_after_block <sid>: true (and consumed) when this Stop follows a message the plugin blocked
+held_after_block() { [ -f "$HANDOFF_DIR/state/$1.held" ] || return 1; rm -f "$HANDOFF_DIR/state/$1.held"; log defer "Stop after a held message (sid=$1): ignored"; }
+pending_prompt() { local p="$HANDOFF_DIR/state/$1.pending-prompt.txt"; [ -s "$p" ] && echo "$p"; }
+# release_held_prompt <sid> <why>: the deferred handoff cannot finish: send the held message back as a normal turn
+release_held_prompt() {
+  local raw="$HANDOFF_DIR/state/$1.pending-raw.txt" R
+  [ -s "$raw" ] || return 0
+  R="$(bash "$T3SH" "$ROOT" "$LOG" "$1" nudge "$raw")"
+  log defer "released the held message of sid=$1 ($2): $R"
+  rm -f "$HANDOFF_DIR/state/$1.pending-prompt.txt" "$raw"
+}
+# defer_on_prompt <sid> <prompt> <doc> <key>: UserPromptSubmit. Prints the hook output and returns 0 when it acted.
+defer_on_prompt() {
+  local sid="$1" p="$2" doc="$3" key="$4" m="$DEFER_DIR/$1" kind pp raw R
+  if is_plugin_prompt "$p"; then rm -f "$HANDOFF_DIR/state/$sid.held"; return 1; fi
+  [ -f "$m" ] || return 1
+  kind="$(cat "$m")"; rm -f "$m"
+  pp="$HANDOFF_DIR/state/$sid.pending-prompt.txt"; raw="$HANDOFF_DIR/state/$sid.pending-raw.txt"
+  printf '%s\n' "$p" > "$raw"
+  { printf '%s\n\n' "The user sent the message below after the previous context of this thread ended. It was held back so that it runs in this fresh context: handle it now, with the handoff document as the record of the work so far (where they conflict, the message wins over the document's Next steps)."
+    printf '%s\n' "$p"; } > "$pp"
+  case "$kind" in
+    all)    R="$(bash "$T3SH" "$ROOT" "$LOG" "$sid" nudge "$HANDOFF_DIR/state/$sid.nudge.txt")" ;;
+    resume) R="$(HANDOFF_RESUME_ARGS="$pp" bash "$T3SH" "$ROOT" "$LOG" "$sid" clear "$doc")"
+            case "$R" in *scheduled*) state_set "$key" t3_clear 1;; esac ;;
+  esac
+  case "$R" in
+    *scheduled*)
+      touch "$HANDOFF_DIR/state/$sid.held"; log defer "held the message of sid=$sid; $kind started: $R"
+      if [ "$kind" = all ]; then W="the handoff document is written first, then your message"; else W="your message"; fi
+      jq -nc --arg r "Handoff plugin: this context is past its handoff limit, so this message is held back: $W runs in a fresh session of this thread. No need to resend it." '{decision:"block", reason:$r}'
+      return 0 ;;
+  esac
+  rm -f "$pp" "$raw"; log defer "deferred $kind could not start for sid=$sid: $R; message runs here"
+  jq -nc --arg m "Handoff plugin: the deferred handoff could not start (${R:-no reason}); this message runs in the current context." '{systemMessage:$m}'
+  return 0
 }

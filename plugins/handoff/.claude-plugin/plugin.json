@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -76,6 +76,12 @@
       "title": "T3: handoff request as its own turn",
       "description": "With T3_AUTOCLEAR: true sends the handoff-writing request to the thread as a separate turn (keeps the previous reply visible). false uses the in-turn Stop nudge; the automatic /clear still runs.",
       "default": true
+    },
+    "T3_DEFER": {
+      "type": "string",
+      "title": "T3: when the handoff runs",
+      "description": "With T3_AUTOCLEAR. off: right after the turn that crosses the threshold. resume: the document is written then, the fresh session starts with your next message. all: nothing at the turn end; your next message starts the handoff (document, then fresh session). In both deferred modes your message is held back and runs in the fresh session.",
+      "default": "off"
     }
   },
   "homepage": "https://github.com/samzilverberg/claude-handoff",

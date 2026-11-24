@@ -63,7 +63,11 @@ exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 | `STARTUP` | ignore | Fresh startup that finds another live session's staged handoff: `ignore` (inject a "not yours" note) or `adopt` |
 | `T3_AUTOCLEAR` | false | T3 layer, inside a T3 Code thread only (see "T3 Code"). The handoff-writing request goes to the thread as its own turn; once the handoff is staged the plugin continues **the same thread** in a fresh Claude session: T3 Code >= 0.1.9 gets one `/handoff:resume` sent as a fresh session (T3 records the new session itself); older T3 gets `/clear` + `/handoff:resume`, with the Claude session id T3 resumes aliased to the new session (so a T3 respawn cannot bring back the pre-clear context). `HANDOFF_T3_FRESH=false` (env) forces the older flow. Threads `/clear`ed by plugin <= 0.5 are recovered on their next message. Requires T3 Code (Beta) >= 0.1.0 and t3ctl. Off, or wherever the preflight fails: the base `/clear` + `/handoff:resume` path |
 | `T3_NUDGE_TURN` | true | With `T3_AUTOCLEAR`: `true` sends the handoff-writing request as its own turn; `false` uses the in-turn Stop nudge (the automatic /clear still runs). Flip it to compare while testing |
+| `T3_DEFER` | off | With `T3_AUTOCLEAR`: when the handoff runs. `off`: right after the turn that crosses the threshold. `resume`: the document is written then, the fresh session waits for your next message. `all`: nothing at the turn end, your next message starts it. See "Deferred handoff". Experimental |
 | `T3_SEND_TIMEOUT` | 600 | Seconds the T3 helper waits for the thread to go idle (and retries a send refused because the thread was busy) |
+
+Per project, a `KEY=VALUE` file `.claude/handoff/handoff.conf` (`#` comments) overrides the userConfig (env still wins);
+handy to try a setting in one project, e.g. `T3_DEFER=all`.
 
 Skills: `/handoff:resume [extra instructions]`, `/handoff:status`, `/handoff:setup [--import]`.
 
@@ -269,7 +273,7 @@ To undo an alias: replace `<R>.jsonl` with `<R>.jsonl.pre-handoff`.
 ## Codex (OpenAI)
 
 The same plugin directory is also a Codex plugin (`.codex-plugin/plugin.json`, marketplace `.agents/plugins/marketplace.json`).
-Codex loads only `hooks/codex-hooks.json` (Stop, SessionStart → `scripts/codex-*.sh`); the Claude hooks are untouched.
+Codex loads only `hooks/codex-hooks.json` (Stop, SessionStart, UserPromptSubmit → `scripts/codex-*.sh`); the Claude hooks are untouched.
 Verified with Codex CLI 0.171 under T3 Code 0.1.11 (t3ctl 0.8.0): three automatic handoffs in a row in one thread, the
 user's directives (a codeword, a style rule) carried through all of them.
 
@@ -315,8 +319,8 @@ Upgrade: `codex plugin marketplace upgrade claude-handoff` (git sources), `codex
 
 Configuration: Codex plugins have no userConfig, so the keys from "Configuration" go in `~/.codex/handoff.conf`
 (`KEY=VALUE`, `#` comments; `HANDOFF_CONF` overrides the path), per project in `.claude/handoff/codex.conf`; env
-`HANDOFF_<KEY>` still wins. Used: `THRESHOLD`, `LIVE_FROM`, `LIVE_EVERY`, `MAX_DOC_CHARS`, `T3_AUTOCLEAR`, `T3_NUDGE_TURN`,
-`T3_SEND_TIMEOUT`. Example:
+`HANDOFF_<KEY>` still wins. Used: `THRESHOLD`, `LIVE_FROM`, `LIVE_EVERY`, `MAX_DOC_CHARS`, `T3_AUTOCLEAR`, `T3_NUDGE_TURN`, `T3_DEFER`,
+`T3_SEND_TIMEOUT`. Per project, `.claude/handoff/codex.conf` then `.claude/handoff/handoff.conf` override the global file. Example:
 
 ```
 THRESHOLD=300000
@@ -325,6 +329,27 @@ T3_AUTOCLEAR=true
 
 Codex auto-compacts at about 90% of the model window (seen at 434k of 475k); the 70% cap keeps the handoff ahead of it.
 `model_auto_compact_token_limit` in `~/.codex/config.toml` moves Codex's own limit if needed.
+
+## Deferred handoff (`T3_DEFER`, experimental)
+
+By default the T3 handoff runs right after the turn that crosses the threshold, so the reply you want to read is
+followed by the handoff turn and the resumed session's first reply. `T3_DEFER` (Claude: userConfig or
+`.claude/handoff/handoff.conf`; Codex: `~/.codex/handoff.conf` or the project files) moves it to your next message:
+
+| Value | At the turn end | Your next message |
+| --- | --- | --- |
+| `off` (default) | handoff request turn, then the fresh session | runs in the fresh session as usual |
+| `resume` | handoff request turn (document written) | held; the fresh session starts with the document and your message |
+| `all` | nothing (the Stop message says the handoff is due) | held; handoff request turn, then the fresh session with the document and your message |
+
+The message is held by the `UserPromptSubmit` hook (`decision: block`; T3 keeps it in the timeline) and re-sent by the
+plugin: Claude gets it as `/handoff:resume` arguments, Codex below the inline document, with a note that it wins over
+the document's Next steps. A Stop right after the held message is ignored; the plugin's own messages
+(`[handoff plugin] …`, `/handoff:resume …`) are never held. Deferral is armed only when the T3 helper reaches the
+thread at that moment; otherwise the handoff runs at once as with `off`. If the handoff cannot finish (no complete
+document after 2 requests, automatic handoff skipped, Codex document with probable secrets) the held message is sent
+back as a normal message in the current session. Attachments of a held message are not carried over (the hook sees
+the text only). Verified live for Codex 0.171 under T3 Code 0.1.11 (`all`).
 
 ## Verified facts (hooks reference + 18 driven sessions)
 

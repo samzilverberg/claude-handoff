@@ -17,6 +17,7 @@ rm -f "$HANDOFF_DIR/by-session/$SID.md"   # first turn after a /clear done in-pr
 # A tombstoned session was already /cleared and superseded; a resume of it is a stale zombie.
 # Do not publish (would re-stage stale content) or nudge — stay inert.
 if is_tombstoned "$SID"; then log stop "tombstoned sid=$SID; inert (no publish/nudge)"; exit 0; fi
+held_after_block "$SID" && exit 0   # T3_DEFER: the message was held back, no real turn ran
 
 # SECTIONS: see handoff-lib.sh
 
@@ -30,7 +31,7 @@ t3_nudge() {
   [ "$(cfg T3_NUDGE_TURN true)" = "true" ] || { R="T3_NUDGE_TURN=false"; return 1; }
   local f="$HANDOFF_DIR/state/$SID.nudge.txt"
   printf '[handoff plugin] %s\n\n(Sent by the handoff plugin as a separate turn so that your previous reply stays the visible answer in T3 Code.)\n' "$1" > "$f"
-  R="$(bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" nudge "$f")"
+  R="$(bash "$T3SH" "$ROOT" "$LOG" "$SID" nudge "$f")"
   case "$R" in *scheduled*) return 0;; *) return 1;; esac
 }
 # emit_nudge <systemMessage> <context>: T3 turn when possible, else in-turn additionalContext.
@@ -85,14 +86,20 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
         failed:*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
         *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
       esac
+    elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && is_armed "$SID"; then
+      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER: that message runs there)." '{systemMessage:$m}'
+    elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ -z "$(pending_prompt "$SID")" ] && [ "$(t3_defer)" = resume ] && defer_arm "$SID" resume; then
+      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER=resume: that message runs there)." '{systemMessage:$m}'
     elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
-      R="$(bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" clear "$F")"
+      # T3_DEFER: a held message (pending prompt) goes into the fresh session as /handoff:resume arguments
+      R="$(HANDOFF_RESUME_ARGS="$(pending_prompt "$SID")" bash "$T3SH" "$ROOT" "$LOG" "$SID" clear "$F")"
       case "$R" in
         *"fresh session) scheduled"*) state_set "$KEY" t3_clear 1
                      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
         *scheduled*) state_set "$KEY" t3_clear 1
                      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
-        *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
+        *)           release_held_prompt "$SID" "automatic handoff skipped"
+                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
       esac
     else
       jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff for this session is written and staged. Type /clear, then /handoff:resume (under T3 Code, T3_AUTOCLEAR does this automatically)." '{systemMessage:$m}'
@@ -101,6 +108,7 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   fi
   if [ "$ATTEMPTS" -ge 2 ]; then
     [ -s "$F" ] && publish "$F" "$SID"
+    release_held_prompt "$SID" "no complete handoff document after 2 requests"
     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff file is $( [ -s "$F" ] && echo "incomplete (missing: $(echo $MISSING | tr '\n' ' '))" || echo missing ); staged as-is. /clear will fall back to the transcript summarizer if needed." '{systemMessage:$m}'
     exit 0
   fi
@@ -112,8 +120,13 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   else
     WHAT="Write the handoff document with the Write tool to $F."
   fi
-  emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}). Asking Claude to write the handoff document before it stops." \
-             "The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task."
+  REQ="The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task."
+  # T3_DEFER=all: nothing now; the user's next message starts the handoff (see defer_on_prompt)
+  if [ "$(t3_defer)" = all ] && [ "$ATTEMPTS" -eq 0 ] && [ "$ACTIVE" != "true" ] && defer_arm "$SID" all "$REQ"; then
+    jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff due: it runs when you send your next message (T3_DEFER=all: handoff document first, then your message in a fresh session)." '{systemMessage:$m}'
+    exit 0
+  fi
+  emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}). Asking Claude to write the handoff document before it stops." "$REQ"
   exit 0
 fi
 

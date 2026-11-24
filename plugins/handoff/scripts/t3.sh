@@ -148,7 +148,8 @@ if [ "$MODE" = "--bg" ]; then
         fail() { echo "failed:$1" > "$OUTCOME"; logq "codex handoff of $TID failed: $1"; exit 0; }
         Rf="$HANDOFF_DIR/state/$LIVE.resume-msg.txt"
         { printf '[handoff plugin] This T3 thread continues in a fresh context. Below is the handoff document that the previous context of this conversation wrote just before it was cleared (saved at %s). Treat it as the record of the work so far. First compare the repository with its "Workspace identity" section (branch, HEAD, uncommitted files): if it differs in a way the document does not explain, tell the user what differs before changing anything. Then continue from "Next steps"; if "Open questions for the user" is non-empty, ask those first. A step that waits for the user (their confirmation, an answer, a "go") stays waiting: say briefly where things stand and stop, do not do it on their behalf.\n\n' "$FILE"
-          awk 'NR==1&&$0=="---"{f=1;next} f&&$0=="---"{f=0;next} !f' "$FILE"; } > "$Rf"
+          awk 'NR==1&&$0=="---"{f=1;next} f&&$0=="---"{f=0;next} !f' "$FILE"
+          [ -s "${HANDOFF_RESUME_ARGS:-}" ] && { printf '\n---\n\n'; cat "$HANDOFF_RESUME_ARGS"; }; } > "$Rf"
         BGASK=1
         if ! send_when_idle "handoff (fresh session)" "$Rf" --fresh; then
           case "$WHYNOT" in
@@ -385,7 +386,8 @@ case "$MODE" in
     else say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID; $FLOWWHY)"; fi
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
     echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"
-    if [ "$AGENT" = codex ]; then bg fresh "$TID" "$ARG" "$SID"; else bg "$FLOW" "$TID" "" "$SID"; fi ;;
+    # HANDOFF_RESUME_ARGS (T3_DEFER): file with the user's held-back message, passed on to the fresh session
+    if [ "$AGENT" = codex ]; then bg fresh "$TID" "$ARG" "$SID"; else bg "$FLOW" "$TID" "${HANDOFF_RESUME_ARGS:-}" "$SID"; fi ;;
 
   recover)
     # Tombstoned session resumed by T3: chain SID -> continued_by -> … -> tail. Stage the newest handoff doc of the
