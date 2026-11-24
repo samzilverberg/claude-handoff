@@ -1,0 +1,12 @@
+{
+  "name": "claude-handoff",
+  "interface": { "displayName": "Claude handoff" },
+  "plugins": [
+    {
+      "name": "handoff",
+      "source": { "source": "local", "path": "./plugins/handoff" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

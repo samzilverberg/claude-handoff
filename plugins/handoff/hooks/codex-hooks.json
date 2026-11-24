@@ -1,0 +1,6 @@
+{
+  "hooks": {
+    "Stop":         [ { "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/codex-stop.sh\"", "timeout": 15 } ] } ],
+    "SessionStart": [ { "hooks": [ { "type": "command", "command": "bash \"${PLUGIN_ROOT:-$CLAUDE_PLUGIN_ROOT}/scripts/codex-sessionstart.sh\"", "timeout": 10 } ] } ]
+  }
+}

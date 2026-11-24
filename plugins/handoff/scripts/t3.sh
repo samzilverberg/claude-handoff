@@ -41,6 +41,11 @@
 # supported, >= MIN_T3 (alias: version only, best effort); thread resolved by exact Claude session id
 # (nativeThreadRef.nativeId), via the alias map, or via our /clear tombstone chain; the thread's workspace is this
 # project dir; the mapping is re-checked right before every send.
+# Codex (HANDOFF_AGENT=codex, from scripts/codex-stop.sh): nudge and clear only, fresh flow only. Codex runs one
+# app-server for every T3 thread (no T3CODE_THREAD_ID), so the thread comes from the db by the Codex session id
+# (nativeThreadRef.nativeId), and the fresh session gets the handoff document inline as its first message (no
+# /handoff:resume skill, no adoption): `clear <doc>` sends "[handoff plugin] … <doc>" with --fresh, then waits for T3
+# to record the new Codex session for the thread and tombstones the old one.
 # Usage: t3.sh <project root> <hooks.log> <claude session id> <mode> [arg]
 #        HANDOFF_T3_FRESH=false: use the clear flow even where T3 offers fresh sessions.
 #        HANDOFF_T3_DRYRUN=1: resolve and print only. HANDOFF_T3_DB: db path override. HANDOFF_T3_SEND_TIMEOUT (600).
@@ -139,6 +144,30 @@ if [ "$MODE" = "--bg" ]; then
     nudge)
       send_when_idle "handoff nudge" "$FILE" && logq "sent handoff nudge turn to $TID"; exit 0 ;;
     fresh)
+      if [ "$AGENT" = codex ]; then
+        fail() { echo "failed:$1" > "$OUTCOME"; logq "codex handoff of $TID failed: $1"; exit 0; }
+        Rf="$HANDOFF_DIR/state/$LIVE.resume-msg.txt"
+        { printf '[handoff plugin] This T3 thread continues in a fresh context. Below is the handoff document that the previous context of this conversation wrote just before it was cleared (saved at %s). Treat it as the record of the work so far. First compare the repository with its "Workspace identity" section (branch, HEAD, uncommitted files): if it differs in a way the document does not explain, tell the user what differs before changing anything. Then continue from "Next steps"; if "Open questions for the user" is non-empty, ask those first. A step that waits for the user (their confirmation, an answer, a "go") stays waiting: say briefly where things stand and stop, do not do it on their behalf.\n\n' "$FILE"
+          awk 'NR==1&&$0=="---"{f=1;next} f&&$0=="---"{f=0;next} !f' "$FILE"; } > "$Rf"
+        BGASK=1
+        if ! send_when_idle "handoff (fresh session)" "$Rf" --fresh; then
+          case "$WHYNOT" in
+            *"$BGMARK"*) fail "handoff in a fresh session not sent: $WHYNOT. Stop this session's background work first: T3 refuses a fresh session while it runs" ;;
+            *) fail "handoff in a fresh session not sent: $WHYNOT" ;;
+          esac
+        fi
+        logq "sent the handoff to $TID in a fresh session"
+        # T3 records the new Codex session for the thread once it starts
+        # (T3 first adds a pending row without a native id: wait for a non-empty id other than the old one)
+        i=0; NEW=""
+        while [ $i -lt $(( ${HANDOFF_T3_CLEAR_WAIT:-30} * 2 )) ]; do
+          NEW="$(session_of_thread "$TID")"; [ -n "$NEW" ] && [ "$NEW" != "$SID" ] && break
+          sleep 0.5; i=$((i+1))
+        done
+        [ -n "$NEW" ] && [ "$NEW" != "$SID" ] || fail "T3 did not record a new Codex session for $TID within ${HANDOFF_T3_CLEAR_WAIT:-30}s"
+        is_tombstoned "$LIVE" || tombstone_set "$LIVE" "codex" >/dev/null; tombstone_link "$LIVE" "$NEW"
+        echo "done:$NEW" > "$OUTCOME"; logq "codex handoff of $TID to fresh session $NEW complete"; exit 0
+      fi
       AUTO="$HANDOFF_DIR/state/t3-fresh/$(printf '%s' "$TID" | tr '/' '_')"
       fail() { rm -f "$AUTO"; echo "failed:$1" > "$OUTCOME"; logq "handoff of $TID failed: $1; type /clear, then /handoff:resume"; exit 0; }
       Rf="$HANDOFF_DIR/state/$LIVE.resume-cmd.txt"
@@ -191,6 +220,7 @@ fi
 # ---- foreground
 skip() { if [ "$MODE" = "check" ]; then say "$1"; exit 1; fi; say "$1; $MODE skipped"; exit 0; }
 case "$MODE" in check|nudge|clear|alias|recover) ;; *) say "unknown mode '$MODE'; skipped"; exit 0;; esac
+[ "$AGENT" = codex ] && case "$MODE" in alias|recover) say "$MODE: Claude only; skipped"; exit 0;; esac
 case "$MODE" in nudge|clear|recover) [ -s "$ARG" ] || { say "$MODE: file '$ARG' missing or empty; skipped"; exit 0; };; esac
 [ "$MODE" = "alias" ] && [ -z "$ARG" ] && { say "alias: no pre-clear session id; skipped"; exit 0; }
 
@@ -250,16 +280,18 @@ FLOW=clear; FLOWWHY="no freshContext in T3 Code $VER"
 if [ "$MODE" != "alias" ]; then
   if [ "$(cfg T3_FRESH true)" != "true" ]; then FLOWWHY="HANDOFF_T3_FRESH=false"
   elif [ "$(jq -r '.capabilities.freshContext // false' <<<"$ENV" 2>/dev/null)" != "true" ]; then :
-  elif [ -z "$T3TID" ]; then FLOWWHY="T3CODE_THREAD_ID not set in this process"
+  elif [ -z "$T3TID" ] && [ "$AGENT" != codex ]; then FLOWWHY="T3CODE_THREAD_ID not set in this process"
   elif ! version_ge "$(t3 --version 2>/dev/null)" 0.8.0; then FLOWWHY="t3ctl $(t3 --version 2>/dev/null) has no send --fresh (needs >= 0.8.0)"
   else FLOW=fresh; FLOWWHY=""; fi
 fi
 FLOWDESC="handoff via fresh session"; [ "$FLOW" = fresh ] || FLOWDESC="handoff via /clear + alias ($FLOWWHY)"
+# Codex: no /clear flow (a Codex /clear is not reachable through T3): fresh sessions or nothing
+[ "$AGENT" = codex ] && [ "$MODE" != alias ] && [ "$FLOW" != fresh ] && skip "Codex handoff needs T3 fresh sessions ($FLOWWHY; T3 Code >= 0.1.9, t3ctl >= 0.8.0)"
 
 if [ "$MODE" = "check" ] && [ -z "$SID" ]; then say "ok: T3 Code $VER, $(basename "$T3DB") readable, t3ctl ready; $FLOWDESC"; exit 0; fi
 
 # 2. thread resolution (alias: of the pre-clear session)
-[ -n "$SID" ] || skip "no Claude session id"
+[ -n "$SID" ] || skip "no $AGENT session id"
 
 # ---- alias where T3 follows /clear itself: nothing to link. Checked before the thread lookup: T3 may already have
 # moved the thread off the pre-clear session. The new session keeps its own id as its key (no aliased-by entry); the
@@ -331,9 +363,12 @@ esac
 # the thread must run in this project dir: its worktree, or (local threads) its project's workspace root
 WT="$(jq -r '.worktreePath // empty' <<<"$TJ")"
 if [ -z "$WT" ]; then PID_="$(jq -r '.projectId // empty' <<<"$TJ")"; WT="$(t3json projects | jq -r --arg p "$PID_" '.[] | select(.id==$p) | .workspaceRoot' 2>/dev/null)"; fi
-[ -n "$WT" ] && [ "$(realdir "$WT")" != "$(realdir "$ROOT")" ] && skip "thread $TID works in $WT, not in this project dir $ROOT"
+if [ -n "$WT" ] && [ "$(realdir "$WT")" != "$(realdir "$ROOT")" ]; then
+  case "$(realdir "$ROOT")/" in "$(realdir "$WT")/"*) [ "$AGENT" = codex ] || skip "thread $TID works in $WT, not in this project dir $ROOT";;
+    *) skip "thread $TID works in $WT, not in this project dir $ROOT";; esac
+fi
 # the fresh session finds the doc by this process's T3 thread: it must be the thread resolved here
-if [ "$FLOW" = fresh ] && [ "$T3TID" != "$TID" ]; then FLOW=clear; FLOWWHY="this process's T3CODE_THREAD_ID $T3TID is not thread $TID"; FLOWDESC="handoff via /clear + alias ($FLOWWHY)"; fi
+if [ "$FLOW" = fresh ] && [ "$AGENT" != codex ] && [ "$T3TID" != "$TID" ]; then FLOW=clear; FLOWWHY="this process's T3CODE_THREAD_ID $T3TID is not thread $TID"; FLOWDESC="handoff via /clear + alias ($FLOWWHY)"; fi
 [ "$MODE" = "check" ] && { say "ok: T3 Code $VER; session $SID -> thread $TID ($ST, matched by $HOW); $FLOWDESC"; exit 0; }
 
 bg() { nohup bash "$0" "$ROOT" "$LOG" "$MSID" --bg "$@" >/dev/null 2>&1 & disown 2>/dev/null || true; }
@@ -345,11 +380,12 @@ case "$MODE" in
     bg nudge "$TID" "$ARG" ;;
 
   clear)
-    if [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
+    if [ "$AGENT" = codex ]; then say "handoff (document sent as a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
+    elif [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
     else say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID; $FLOWWHY)"; fi
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
     echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"
-    bg "$FLOW" "$TID" "" "$SID" ;;
+    if [ "$AGENT" = codex ]; then bg fresh "$TID" "$ARG" "$SID"; else bg "$FLOW" "$TID" "" "$SID"; fi ;;
 
   recover)
     # Tombstoned session resumed by T3: chain SID -> continued_by -> … -> tail. Stage the newest handoff doc of the

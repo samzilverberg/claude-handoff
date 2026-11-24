@@ -6,6 +6,10 @@ that crosses a context threshold: Claude writes a structured handoff document it
 (`T3_AUTOCLEAR`) does it for you, in the same thread: on T3 Code >= 0.1.9 it sends `/handoff:resume` as a fresh session (T3's own `/clear`), on older T3 it types `/clear` + `/handoff:resume` and keeps T3 pointed at the live session. Running `/handoff:resume` without `/clear` just adds the document on top of the full context. Auto-compact stays on only as a safeguard far above the
 threshold. Verified against Claude Code 2.1.263 with 18 driven test sessions plus real long sessions.
 
+**OpenAI Codex** is supported too (since 0.8, same plugin dir, separate hooks): Codex writes the same document at the
+threshold, and under T3 Code the thread continues from it in a fresh Codex session automatically. See
+[Codex](#codex-openai).
+
 ```
 turn ends ─Stop hook─▶ ctx ≥ THRESHOLD?  (never mid-turn)
    │  no handoff yet  → Claude is asked to write .claude/handoff/sessions/<sid>.md, then stop
@@ -55,6 +59,7 @@ exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 | `LIVE_EVERY` | 20000 | Re-update the running handoff only after the context grew by this many tokens |
 | `MODE` | inject | PreCompact safeguard: `inject` stages a handoff and lets compaction run; `block` refuses proactive auto-compact and asks for `/clear` |
 | `MODEL` / `EFFORT` | claude-opus-4-8 / medium | Nested `claude -p` summarizer, used only when Claude did not write the handoff itself |
+| `MAX_DOC_CHARS` | 200000 | Size limit of the handoff document (characters, ~50k tokens). Above it Claude is asked to condense it before staging (see "Checks before staging"). 0 = no limit |
 | `STARTUP` | ignore | Fresh startup that finds another live session's staged handoff: `ignore` (inject a "not yours" note) or `adopt` |
 | `T3_AUTOCLEAR` | false | T3 layer, inside a T3 Code thread only (see "T3 Code"). The handoff-writing request goes to the thread as its own turn; once the handoff is staged the plugin continues **the same thread** in a fresh Claude session: T3 Code >= 0.1.9 gets one `/handoff:resume` sent as a fresh session (T3 records the new session itself); older T3 gets `/clear` + `/handoff:resume`, with the Claude session id T3 resumes aliased to the new session (so a T3 respawn cannot bring back the pre-clear context). `HANDOFF_T3_FRESH=false` (env) forces the older flow. Threads `/clear`ed by plugin <= 0.5 are recovered on their next message. Requires T3 Code (Beta) >= 0.1.0 and t3ctl. Off, or wherever the preflight fails: the base `/clear` + `/handoff:resume` path |
 | `T3_NUDGE_TURN` | true | With `T3_AUTOCLEAR`: `true` sends the handoff-writing request as its own turn; `false` uses the in-turn Stop nudge (the automatic /clear still runs). Flip it to compare while testing |
@@ -82,6 +87,30 @@ this order. The Stop hook checks the headers are present before staging (one ret
 The nudge also says: re-read the user's messages before writing and make sure every directive appears under
 Standing instructions. In live mode the two log sections are append-only; other sections are kept under ~100 lines.
 The exact prompt text lives in `scripts/handoff-stop.sh` (`SECTIONS`) and `scripts/handoff-lib.sh` (`generate_handoff`).
+
+### Checks before staging, and the workspace stamp
+
+Before a complete document is staged (and, under T3, before the automatic handoff), the Stop hook checks it:
+
+* **Probable secrets**: private keys, `sk-…` API keys, GitHub (`ghp_…`, `github_pat_…`), AWS (`AKIA…`/`ASIA…`), Slack
+  (`xox?-…`) and bearer tokens. The request already says not to copy secret values; a hit asks for a redaction naming
+  the line.
+* **Size** over `MAX_DOC_CHARS` (200000 characters by default, room for long chains of handoffs): a request to condense,
+  keeping Standing instructions, Decisions log and Next steps complete.
+
+Up to two fix requests, then the document is staged anyway with a warning in the Stop message. Exception (Codex under
+T3): a document that still has probable secrets is not sent into the thread, since the message would keep them in T3's
+db; the Stop message says to redact and resume by hand.
+
+At staging the plugin appends (and on every later staging rewrites) a **Workspace identity** section: directory, git
+branch, HEAD commit and uncommitted files (its own `.claude/handoff/` excluded). The resume instructions tell the next
+context to compare the repository with it and to tell the user about an unexplained difference before changing
+anything. The document request also asks to mark anything in Current state that was not actually checked as
+`UNVERIFIED`. (Ideas taken from the `context-handoff` Codex plugin's packet validator and destination sentinel.)
+
+A handoff that goes stale (the user keeps working without the handoff) is refreshed after `LIVE_EVERY` tokens counted
+from the **staging** of the current version, not from the request that produced it: writing a large document in a
+separate T3 turn can grow the context by more than `LIVE_EVERY` on its own.
 
 ## What you will see
 
@@ -236,6 +265,66 @@ prints `ok: …` or the blocking reason. `HANDOFF_T3_DRYRUN=1` resolves without 
 is reported in the next Stop message; the manual fallback is `/clear` then `/handoff:resume` (in the T3 composer `/clear`
 starts a fresh session on 0.1.9+, which adopts the staged doc; on older T3 the alias still runs on a typed `/clear`).
 To undo an alias: replace `<R>.jsonl` with `<R>.jsonl.pre-handoff`.
+
+## Codex (OpenAI)
+
+The same plugin directory is also a Codex plugin (`.codex-plugin/plugin.json`, marketplace `.agents/plugins/marketplace.json`).
+Codex loads only `hooks/codex-hooks.json` (Stop, SessionStart → `scripts/codex-*.sh`); the Claude hooks are untouched.
+Verified with Codex CLI 0.171 under T3 Code 0.1.11 (t3ctl 0.8.0): three automatic handoffs in a row in one thread, the
+user's directives (a codeword, a style rule) carried through all of them.
+
+```
+turn ends ─Stop─▶ ctx (rollout token_count: last input + output) ≥ THRESHOLD (capped at 70% of the model window)?
+   │  T3 + T3_AUTOCLEAR: t3.sh nudge sends "[handoff plugin] … write the handoff to .claude/handoff/sessions/<sid>.md"
+   │                     as its own turn; elsewhere Stop {"decision":"block","reason":…} (a continuation of the turn)
+   │  file incomplete → one more ask naming the missing sections (max 2)
+   │  file complete   → T3: `t3ctl threads send <thread> --fresh "<resume note + the document inline>"`; T3 starts a
+   │                    new Codex session in the same thread and records it; the old session is tombstoned
+   │                    elsewhere: "start a new session (/new) and resume from <file>" (skill: $handoff-resume)
+loop guard: a session hands off only after growing LIVE_EVERY since its first Stop (a fresh session that starts at or
+            above the threshold does not bounce straight into the next handoff)
+SessionStart(compact): Codex compacted anyway → the state restarts and the model is pointed at the session's document
+```
+
+Differences from the Claude side, and why:
+
+* **Keyed by Codex session id, no pids.** T3 runs one Codex app-server for all its Codex threads: every hook has the same
+  parent pid and there is no `T3CODE_THREAD_ID`. `t3.sh` finds the thread in T3's db by the session id
+  (`nativeThreadRef.nativeId`), as it does for Claude.
+* **The document travels inline** in the fresh session's first message (a user turn, the trusted channel), so there is
+  no `/handoff:resume`, no adoption at SessionStart and no `current.md`/`by-pid` bookkeeping.
+* **Fresh flow only.** No `/clear` + alias flow (T3 Code >= 0.1.9 with `freshContext` and t3ctl >= 0.8.0 required for
+  the automation; otherwise the Stop message says to start a fresh session by hand).
+* **No transcript summarizer fallback** (Codex caps SessionEnd hooks at a few seconds). If Codex auto-compacts first,
+  its own summary applies, plus the SessionStart(compact) pointer to the document when one exists.
+* Documents live in the project's `.claude/handoff/sessions/`, shared with the Claude side, so `/handoff:setup`'s
+  gitignore covers both agents (Codex sessions in T3 scratch threads write under that scratch dir).
+
+Install (local clone; a git source works the same way):
+
+```
+codex plugin marketplace add /path/to/claude-handoff
+codex plugin add handoff@claude-handoff
+python3 /path/to/claude-handoff/plugins/handoff/scripts/codex-trust.py --yes    # after every install/upgrade
+```
+
+Codex runs a plugin hook only once it is trusted, and the trust hash covers the plugin's files, so every upgrade needs a
+new review: `/hooks` in the Codex TUI, or `codex-trust.py` (lists the handoff hooks; `--yes` records their current
+hashes through `codex app-server`). Hooks are loaded when a session starts: running sessions keep the old set.
+Upgrade: `codex plugin marketplace upgrade claude-handoff` (git sources), `codex plugin add handoff@claude-handoff`, trust.
+
+Configuration: Codex plugins have no userConfig, so the keys from "Configuration" go in `~/.codex/handoff.conf`
+(`KEY=VALUE`, `#` comments; `HANDOFF_CONF` overrides the path), per project in `.claude/handoff/codex.conf`; env
+`HANDOFF_<KEY>` still wins. Used: `THRESHOLD`, `LIVE_FROM`, `LIVE_EVERY`, `MAX_DOC_CHARS`, `T3_AUTOCLEAR`, `T3_NUDGE_TURN`,
+`T3_SEND_TIMEOUT`. Example:
+
+```
+THRESHOLD=300000
+T3_AUTOCLEAR=true
+```
+
+Codex auto-compacts at about 90% of the model window (seen at 434k of 475k); the 70% cap keeps the handoff ahead of it.
+`model_auto_compact_token_limit` in `~/.codex/config.toml` moves Codex's own limit if needed.
 
 ## Verified facts (hooks reference + 18 driven sessions)
 

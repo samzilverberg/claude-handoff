@@ -14,8 +14,22 @@ CURRENT="$HANDOFF_DIR/current.md"          # the file CLAUDE.md @imports
 OWNER="$HANDOFF_DIR/current.owner"         # pid of the claude process whose handoff is in current.md
 LOG="$HANDOFF_DIR/hooks.log"
 mkdir -p "$HANDOFF_DIR/sessions" "$HANDOFF_DIR/by-pid" "$HANDOFF_DIR/state" "$HANDOFF_DIR/state/tombstones" "$HANDOFF_DIR/state/pid-cleared"
-# cfg KEY default -> env HANDOFF_KEY (session override) > plugin userConfig (CLAUDE_PLUGIN_OPTION_KEY) > default
-cfg() { local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"; [ -n "$v" ] || v="$(printenv "CLAUDE_PLUGIN_OPTION_$k" 2>/dev/null)"; printf '%s' "${v:-$d}"; }
+# Which agent runs the hooks: claude (default) or codex (scripts/codex-*.sh set HANDOFF_AGENT=codex before sourcing).
+AGENT="${HANDOFF_AGENT:-claude}"
+# Codex plugins have no userConfig: their settings live in a KEY=VALUE file (HANDOFF_CONF, default ~/.codex/handoff.conf).
+HANDOFF_CONF="${HANDOFF_CONF:-${CODEX_HOME:-$HOME/.codex}/handoff.conf}"
+# cfg KEY default -> env HANDOFF_KEY (session override) > plugin userConfig (CLAUDE_PLUGIN_OPTION_KEY; codex: the conf
+# file) > default
+cfg() {
+  local k="$1" d="$2" v; v="$(printenv "HANDOFF_$k" 2>/dev/null)"
+  if [ -z "$v" ] && [ "$AGENT" = codex ]; then
+    local f; for f in "$HANDOFF_DIR/codex.conf" "$HANDOFF_CONF"; do   # per project, then global
+      [ -f "$f" ] && v="$(sed -n "s/^[[:space:]]*$k[[:space:]]*=[[:space:]]*//p" "$f" | tail -1 | sed 's/[[:space:]]*\(#.*\)\{0,1\}$//; s/^"\(.*\)"$/\1/')"
+      [ -n "$v" ] && break
+    done
+  elif [ -z "$v" ]; then v="$(printenv "CLAUDE_PLUGIN_OPTION_$k" 2>/dev/null)"; fi
+  printf '%s' "${v:-$d}"
+}
 # state get/set per session (tiny json)
 state_get() { local f="$HANDOFF_DIR/state/$1.json"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" || true; }
 state_set() { local f="$HANDOFF_DIR/state/$1.json"; local cur='{}'; [ -f "$f" ] && cur="$(cat "$f")"; jq -c --arg k "$2" --arg v "$3" '.[$k]=$v' <<<"$cur" > "$f"; }
@@ -27,6 +41,61 @@ REQUIRED_SECTIONS="Goal|Standing instructions|Decisions|Current state|In progres
 # missing_sections <file> -> prints missing section names (one per line); empty when all present
 missing_sections() { local f="$1"; echo "$REQUIRED_SECTIONS" | tr '|' '\n' | while read -r sec; do grep -qiE "^##+ .*${sec}" "$f" 2>/dev/null || echo "$sec"; done; }
 log() { printf '%s [%s] %s\n' "$(date +%H:%M:%S)" "$1" "$2" >> "$LOG"; }
+timed() { local s="$1"; shift; perl -e 'alarm shift; exec @ARGV' "$s" "$@"; }   # timed <sec> <cmd…> (hook time limits)
+
+# --- document checks, run before a handoff document is staged or sent ---------------------------------------------
+# label|ERE. Anchored on a non-word character (or line start) where a prefix could end an ordinary word ("risk-…").
+SECRET_PATTERNS='private key|-----BEGIN [A-Z ]*PRIVATE KEY-----
+OpenAI/Anthropic-style API key|(^|[^A-Za-z0-9_-])sk-(ant-|proj-)?[A-Za-z0-9_-]{20,}
+GitHub token|(^|[^A-Za-z0-9_])(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})
+AWS access key|(^|[^A-Z0-9])(AKIA|ASIA)[0-9A-Z]{16}
+Slack token|(^|[^A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}
+bearer token|[Bb]earer [A-Za-z0-9._~+/=-]{20,}'
+# secret_hits <file> -> "label (line N)" per hit, at most 10
+secret_hits() {
+  local f="$1" label re
+  while IFS='|' read -r label re; do
+    [ -n "$re" ] || continue
+    grep -nE -- "$re" "$f" 2>/dev/null | cut -d: -f1 | awk -v l="$label" '{print l " (line " $0 ")"}'
+  done <<<"$SECRET_PATTERNS" | head -n 10
+}
+# doc_problems <file> -> one line per problem (empty = fine): probable secrets, size over MAX_DOC_CHARS (200000)
+doc_problems() {
+  local f="$1" max n hits; max="$(cfg MAX_DOC_CHARS 200000)"
+  hits="$(secret_hits "$f" | paste -sd ',' - | sed 's/,/, /g')"
+  [ -n "$hits" ] && echo "probable secrets: $hits. Replace each value with a placeholder that says what it was and where it lives (e.g. <GitHub token, from ~/.config/gh>), never the value."
+  n="$(wc -c <"$f" | tr -d ' ')"
+  [ "$max" -gt 0 ] && [ "$n" -gt "$max" ] && echo "size: $n characters, over the limit of $max (MAX_DOC_CHARS). Condense it: keep Standing instructions, Decisions log and Next steps complete, shorten the narrative sections, and point to files or commits instead of pasting their content."
+  return 0
+}
+
+# stamp_workspace <file> [dir]: (re)write the trailing "Workspace identity" section the plugin records at staging time
+# (directory, git branch, HEAD, uncommitted files), so the next context can tell whether the repo moved since. Replaces
+# an earlier stamp; everything from the marker line on belongs to the plugin.
+WS_MARK='<!-- handoff plugin: workspace identity (rewritten at every staging) -->'
+stamp_workspace() {
+  local f="$1" dir="${2:-$ROOT}" tmp top st n
+  [ -s "$f" ] || return 1
+  tmp="$f.ws.$$"
+  awk -v m="$WS_MARK" '$0==m{exit} /^[[:space:]]*$/{b=b $0 "\n"; next} {printf "%s", b; b=""; print}' "$f" > "$tmp"
+  {
+    printf '\n%s\n## Workspace identity (recorded by the handoff plugin, %s)\n\n- Directory: `%s`\n' "$WS_MARK" "$(date '+%Y-%m-%d %H:%M %Z')" "$dir"
+    if top="$(timed 5 git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" && [ -n "$top" ]; then
+      printf -- '- Repository: `%s`\n- Branch: `%s`\n- HEAD: `%s`\n' "$top" \
+        "$(timed 5 git -C "$dir" symbolic-ref --short -q HEAD 2>/dev/null || echo '(detached)')" \
+        "$(timed 5 git -C "$dir" log -1 --format='%h %s' 2>/dev/null | cut -c1-120)"
+      st="$(timed 5 git -C "$dir" --no-optional-locks status --short 2>/dev/null | grep -v '\.claude/handoff/')"
+      n="$(printf '%s' "$st" | grep -c .)"
+      if [ "$n" -eq 0 ]; then printf -- '- Uncommitted changes: none\n'
+      else
+        printf -- '- Uncommitted changes (%s):\n\n```\n%s\n```\n' "$n" "$(printf '%s\n' "$st" | head -n 40)"
+        [ "$n" -gt 40 ] && printf -- '(and %s more)\n' $((n - 40))
+      fi
+    else printf -- '- Not a git repository\n'; fi
+    printf '\nOn resume: compare the repository with this record (branch, HEAD, uncommitted files). If it differs in a way this document does not explain, tell the user what differs before changing anything.\n'
+  } >> "$tmp"
+  mv "$tmp" "$f"
+}
 now() { date +%s; }
 mtime() { stat -f %m "$1" 2>/dev/null || echo 0; }
 age() { echo $(( $(now) - $(mtime "$1") )); }
@@ -47,12 +116,23 @@ claude_pid() {
 CPID="$(claude_pid)"
 
 # Approx current context = usage of the last assistant message in the transcript.
+# Codex: the rollout's last token_count event (input + output of the last model request = what the next one reads).
 context_tokens() {
   local t="$1"; [ -f "$t" ] || { echo 0; return; }
+  if [ "$AGENT" = codex ]; then
+    grep '"type":"token_count"' "$t" | tail -n 1 | jq -r '.payload.info.last_token_usage // {} | ((.input_tokens // 0) + (.output_tokens // 0))' 2>/dev/null || echo 0
+    return
+  fi
   # max over the last 3 assistant messages: the transcript may not have flushed the final message yet at Stop time
   grep '"type":"assistant"' "$t" | tail -n 3 | jq -rs 'map((.message.usage // {}) as $u
     | (($u.input_tokens // 0) + ($u.cache_read_input_tokens // 0) + ($u.cache_creation_input_tokens // 0))) | max // 0' 2>/dev/null || echo 0
 }
+
+# codex_window <rollout>: the model's context window as Codex reports it (0 when unknown)
+codex_window() { grep '"type":"token_count"' "$1" 2>/dev/null | tail -n 1 | jq -r '.payload.info.model_context_window // 0' 2>/dev/null || echo 0; }
+
+# The nine handoff sections (both agents' end-of-turn requests).
+SECTIONS='Sections, in this order: # Handoff; ## Goal (the user'"'"'s actual ask, their words where possible); ## Standing instructions from the user (EVERY steering directive the user gave in this conversation, in order, near-verbatim, one bullet each: scope limits, "do not X", "always Y", style/format preferences, process rules, corrections of your behaviour. Tag each [active] or [superseded by #n] or [withdrawn], and name its source: which user message (quote a few words), CLAUDE.md, or a hook note; do not attribute a chat instruction to CLAUDE.md. Never drop an entry because it was later changed; the successor must see the history); ## Decisions log (each significant decision: what, who decided (user/assistant), why, and [active] or [reversed by #n]); ## Current state (done + how verified; mark anything not actually checked in this conversation UNVERIFIED); ## In progress (exact step when context ended); ## Next steps (ordered, actionable); ## Key files & symbols (path:line, one-line role); ## Gotchas / dead ends (tried and rejected, why); ## Open questions for the user. Before writing, re-read the user'"'"'s messages in this conversation and make sure every directive appears under Standing instructions. Be concrete: paths, symbols, commands, exact decisions. No placeholders. Never copy secret values (API keys, tokens, passwords, private keys) into it: name them and where they live instead. The plugin appends a Workspace identity section (git branch, HEAD, changes) itself.'
 
 # T3 Code sets T3CODE_THREAD_ID (its thread id) in the env of the agent processes it runs. A T3 "fresh session"
 # (composer /clear, or a send with freshContext: T3 Code >= 0.1.9) replaces the process: the new session starts with
@@ -73,6 +153,7 @@ drop_thread_doc() {
 # (+ by-thread copy under T3 Code, see above; sid = the session whose handoff it is).
 publish() {
   local f="$1" sid="${2:-}"; [ -s "$f" ] || return 1
+  stamp_workspace "$f"
   cp "$f" "$HANDOFF_DIR/by-pid/$CPID.md"; cp "$f" "$CURRENT"; echo "$CPID" > "$OWNER"
   if [ -n "$T3TID" ]; then
     local b; b="$(thread_doc)"; mkdir -p "$BYTHREAD"; cp "$f" "$b.md"
@@ -80,6 +161,15 @@ publish() {
       '{sid:$sid, key:$key, pid:$pid, doc:$doc, at:$at}' > "$b.json"
   fi
   log publish "pid=$CPID <- $f${T3TID:+ (+ by-thread $T3TID)}"
+}
+# note_publish <key> <file> <ctx>: remember the context size at which this version of the document was staged. A
+# version = a hash of the model-written part (the workspace stamp, rewritten at every staging, excluded). The "refresh
+# a stale handoff" request counts growth from there, not from the request that produced the document: writing a large
+# document can itself grow the context past LIVE_EVERY.
+note_publish() {
+  local h; h="$(awk -v m="$WS_MARK" '$0==m{exit} {print}' "$2" | shasum | cut -c1-16)"
+  [ "$h" = "$(state_get "$1" pub_hash)" ] && return 0
+  state_set "$1" pub_hash "$h"; state_set "$1" pub_ctx "$3"
 }
 reset_current() { printf '# Handoff\n(none)\n' > "$CURRENT"; rm -f "$OWNER"; log reset "pid=$CPID"; }
 owner_pid() { cat "$OWNER" 2>/dev/null || echo ""; }
@@ -106,12 +196,12 @@ generate_handoff() {
 A fresh instance of the same agent will read ONLY this document plus the repo, then continue the work.
 The transcript below contains the user'"'"'s messages in full. Every instruction the user gave is steering that the
 successor must know about, even if it was later changed: record it and mark its status rather than dropping it.
-Markdown, exactly these sections, in this order, bullets, concrete (paths, symbols, commands, exact decisions), no placeholders:
+Markdown, exactly these sections, in this order, bullets, concrete (paths, symbols, commands, exact decisions), no placeholders, no secret values (name keys/tokens/passwords and where they live instead):
 # Handoff
 ## Goal (the user'"'"'s actual ask, their words where possible)
 ## Standing instructions from the user (every directive, in order, near-verbatim: scope limits, "do not X", "always Y", style/format preferences, process rules, corrections. Tag each [active] / [superseded by #n] / [withdrawn]; name the source: user message (quote a few words), CLAUDE.md, or hook note)
 ## Decisions log (each significant decision: what, who decided (user/assistant), why, [active] / [reversed by #n])
-## Current state (DONE, and how it was verified)
+## Current state (DONE, and how it was verified; mark anything not actually checked UNVERIFIED)
 ## In progress (exact step being executed when context ended)
 ## Next steps (ordered, actionable)
 ## Key files & symbols (path:line where known, one-line role each)

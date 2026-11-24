@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -51,6 +51,13 @@
       "title": "Summarizer effort",
       "description": "Effort level for the summarizer.",
       "default": "medium"
+    },
+    "MAX_DOC_CHARS": {
+      "type": "number",
+      "title": "Handoff document size limit (characters)",
+      "description": "Above this size Claude is asked to condense the handoff document before it is staged (up to 2 requests, then staged with a warning). 0 = no limit.",
+      "default": 200000,
+      "min": 0
     },
     "STARTUP": {
       "type": "string",

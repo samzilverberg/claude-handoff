@@ -1,0 +1,18 @@
+{
+  "name": "handoff",
+  "version": "0.8.0",
+  "description": "End-of-turn context handoff for Codex: at a context threshold Codex writes a handoff document; under T3 Code (T3_AUTOCLEAR) the thread continues from it in a fresh session automatically.",
+  "author": { "name": "Sam Zilverberg", "url": "https://github.com/samzilverberg" },
+  "homepage": "https://github.com/samzilverberg/claude-handoff",
+  "repository": "https://github.com/samzilverberg/claude-handoff",
+  "license": "MIT",
+  "keywords": ["context", "compaction", "handoff", "hooks"],
+  "skills": "./codex-skills/",
+  "hooks": "./hooks/codex-hooks.json",
+  "interface": {
+    "displayName": "Handoff",
+    "shortDescription": "End-of-turn handoff instead of mid-turn auto-compact",
+    "developerName": "Sam Zilverberg",
+    "category": "Productivity"
+  }
+}

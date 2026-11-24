@@ -18,7 +18,7 @@ rm -f "$HANDOFF_DIR/by-session/$SID.md"   # first turn after a /clear done in-pr
 # Do not publish (would re-stage stale content) or nudge — stay inert.
 if is_tombstoned "$SID"; then log stop "tombstoned sid=$SID; inert (no publish/nudge)"; exit 0; fi
 
-SECTIONS='Sections, in this order: # Handoff; ## Goal (the user'"'"'s actual ask, their words where possible); ## Standing instructions from the user (EVERY steering directive the user gave in this conversation, in order, near-verbatim, one bullet each: scope limits, "do not X", "always Y", style/format preferences, process rules, corrections of your behaviour. Tag each [active] or [superseded by #n] or [withdrawn], and name its source: which user message (quote a few words), CLAUDE.md, or a hook note; do not attribute a chat instruction to CLAUDE.md. Never drop an entry because it was later changed; the successor must see the history); ## Decisions log (each significant decision: what, who decided (user/assistant), why, and [active] or [reversed by #n]); ## Current state (done + how verified); ## In progress (exact step when context ended); ## Next steps (ordered, actionable); ## Key files & symbols (path:line, one-line role); ## Gotchas / dead ends (tried and rejected, why); ## Open questions for the user. Before writing, re-read the user'"'"'s messages in this conversation and make sure every directive appears under Standing instructions. Be concrete: paths, symbols, commands, exact decisions. No placeholders.'
+# SECTIONS: see handoff-lib.sh
 
 # Nudges are normally delivered in-turn (Stop additionalContext). Under T3 Code with T3_AUTOCLEAR that makes the
 # "handoff written" note the turn's last assistant message, and T3's timeline shows only that one, folding the real
@@ -49,7 +49,8 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   MISSING=""; [ -s "$F" ] && MISSING="$(missing_sections "$F")"
   # Complete handoff exists but the user kept working without /clear: once the context grew by LIVE_EVERY since the
   # last write, ask for a refresh instead of restaging a stale document.
-  if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ] && [ "$ACTIVE" != "true" ] && [ $((CTX - FINAL_AT)) -ge "$LIVE_EVERY" ]; then
+  PUB_AT="$(state_get "$KEY" pub_ctx)"
+  if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$PUB_AT" ] && [ "$ACTIVE" != "true" ] && [ $((CTX - PUB_AT)) -ge "$LIVE_EVERY" ]; then
     state_set "$KEY" final_written_ctx "$CTX"
     emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}), ${LIVE_EVERY}+ tokens past the last handoff. Asking Claude to refresh the handoff document. Then /clear (under T3 Code with T3_AUTOCLEAR the plugin does that by itself)." \
                "The context window is at ${CTX} tokens, past the handoff limit of ${THR}, and the handoff document $F is out of date. Before stopping: update it so every section reflects the current state (overwrite with Write; Standing instructions and Decisions log are append-only, add new entries and re-tag old ones). ${SECTIONS} Then stop; do not continue the task."
@@ -57,27 +58,44 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   fi
   if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ]; then
     [ "$ACTIVE" = "true" ] && state_set "$KEY" final_written_ctx "$CTX"
-    publish "$F" "$SID"
+    # document checks before the first staging (doc_problems: probable secrets, size): up to 2 fix requests, then
+    # staged anyway with a warning
+    DW=""
+    if [ "$(state_get "$KEY" t3_clear)" != "1" ]; then
+      PROB="$(doc_problems "$F")"
+      if [ -n "$PROB" ]; then
+        FIX="$(state_get "$KEY" fix_attempts)"; FIX="${FIX:-0}"
+        if [ "$FIX" -lt 2 ]; then
+          state_set "$KEY" fix_attempts "$((FIX+1))"
+          emit_nudge "Handoff: the handoff document needs a fix before it is staged ($(cut -d. -f1 <<<"$PROB" | paste -sd ';' -))." \
+                     "The handoff document $F is complete but cannot be staged as is: $(paste -sd ' ' - <<<"$PROB") Fix the file (overwrite it), keeping every section. Then stop; do not continue the task."
+          exit 0
+        fi
+        DW=" Warning: the document still has $(cut -d. -f1 <<<"$PROB" | paste -sd ';' -) after 2 fix requests."
+        log stop "staging despite: $(paste -sd ' ' - <<<"$PROB")"
+      fi
+    fi
+    publish "$F" "$SID"; note_publish "$KEY" "$F" "$CTX"
     # T3 layer (t3.sh clear): /handoff:resume in a fresh session of this thread, or /clear + /handoff:resume. t3_clear
     # latches only once scheduled; a skip (thread not resolved, t3ctl missing …) is retried on the next Stop.
     # Outcome: state/<sid>.t3clear.
     if [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ "$(state_get "$KEY" t3_clear)" = "1" ]; then
       RS="$(cat "$HANDOFF_DIR/state/$SID.t3clear" 2>/dev/null)"
       case "$RS" in
-        failed:*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
-        *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
+        failed:*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
+        *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
       esac
     elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
       R="$(bash "$(dirname "$0")/t3.sh" "$ROOT" "$LOG" "$SID" clear "$F")"
       case "$R" in
         *"fresh session) scheduled"*) state_set "$KEY" t3_clear 1
-                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
+                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
         *scheduled*) state_set "$KEY" t3_clear 1
-                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
-        *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
+                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
+        *)           jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
       esac
     else
-      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff for this session is written and staged. Type /clear, then /handoff:resume (under T3 Code, T3_AUTOCLEAR does this automatically)." '{systemMessage:$m}'
+      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff for this session is written and staged. Type /clear, then /handoff:resume (under T3 Code, T3_AUTOCLEAR does this automatically)." '{systemMessage:$m}'
     fi
     exit 0
   fi
