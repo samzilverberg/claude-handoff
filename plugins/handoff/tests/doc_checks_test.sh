@@ -10,6 +10,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1 ($2)"; fi; }
 
 W="$(mktemp -d -t handoff-doc)"; trap 'rm -rf "$W"' EXIT
 unset T3CODE_THREAD_ID HANDOFF_THRESHOLD HANDOFF_LIVE_FROM HANDOFF_LIVE_EVERY HANDOFF_MAX_DOC_CHARS
+export HANDOFF_LOOP_GUARD=false HANDOFF_MAX_DOC_SHARE=0   # both covered in guards_test.sh
 export HANDOFF_T3_AUTOCLEAR=false HANDOFF_CONF="$W/none.conf" HANDOFF_T3_DB="$W/no-t3.sqlite"
 doc() { printf '# Handoff\n## Goal\ng\n## Standing instructions from the user\ns\n## Decisions log\nd\n## Current state\n%s\n## In progress\ni\n## Next steps\nn\n## Key files & symbols\nk\n## Gotchas / dead ends\nx\n## Open questions for the user\nnone\n' "${2:-c}" > "$1"; }
 GH="ghp_$(printf 'a%.0s' $(seq 1 30))"

@@ -37,10 +37,11 @@ emit_nudge() {
 }
 
 # Loop guard: a session that starts at or above the threshold (a big handoff document, a threshold below the fresh
-# context's base size) would hand off again at once, every session. The final handoff needs the session to have grown
-# by LIVE_EVERY since its first Stop (or to be in the middle of one: FINAL_AT set).
+# context's base size) would hand off again at once, every session. Such a session (first Stop at or above the
+# threshold) hands off only after growing by LIVE_EVERY since that first Stop, unless a handoff is already under way
+# (FINAL_AT set). LOOP_GUARD=false turns it off.
 FIRST="$(state_get "$SID" first_ctx)"; [ -n "$FIRST" ] || { FIRST="$CTX"; state_set "$SID" first_ctx "$CTX"; }
-if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ] && [ -z "$(state_get "$SID" final_written_ctx)" ] && [ $((CTX - FIRST)) -lt "$LIVE_EVERY" ]; then
+if [ "$(cfg LOOP_GUARD true)" = true ] && [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ] && [ "$FIRST" -ge "$THR" ] && [ -z "$(state_get "$SID" final_written_ctx)" ] && [ $((CTX - FIRST)) -lt "$LIVE_EVERY" ]; then
   log codex-stop "ctx $CTX >= thr $THR but the session started at $FIRST (< $LIVE_EVERY growth): no handoff yet"
   exit 0
 fi
@@ -63,7 +64,7 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
     # (the message would keep them in T3's db).
     DW=""; NOSEND=""
     if [ "$(state_get "$SID" t3_clear)" != "1" ]; then
-      PROB="$(doc_problems "$F")"
+      PROB="$(doc_problems "$F" "$THR")"
       if [ -n "$PROB" ]; then
         FIX="$(state_get "$SID" fix_attempts)"; FIX="${FIX:-0}"
         if [ "$FIX" -lt 2 ]; then

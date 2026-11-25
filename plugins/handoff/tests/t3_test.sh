@@ -14,6 +14,7 @@ export CLAUDE_PROJECT_DIR="$TMP"
 export CLAUDE_HANDOFF_NESTED=""
 unset T3CODE_THREAD_ID   # set per case: T3 Code exports it to its agent processes (and this suite may run inside T3)
 export HANDOFF_THRESHOLD=1000 HANDOFF_LIVE_FROM=0
+export HANDOFF_LOOP_GUARD=false HANDOFF_MAX_DOC_SHARE=0   # both covered in guards_test.sh
 export HANDOFF_T3_AUTOCLEAR=true
 export __CFBundleIdentifier=com.t3tools.t3code      # host guard: pretend T3 Code spawned us
 export HANDOFF_T3_DB="$TMP/statev2.sqlite"

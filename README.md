@@ -60,6 +60,8 @@ exported to hooks as `CLAUDE_PLUGIN_OPTION_<KEY>`) > built-in default:
 | `MODE` | inject | PreCompact safeguard: `inject` stages a handoff and lets compaction run; `block` refuses proactive auto-compact and asks for `/clear` |
 | `MODEL` / `EFFORT` | claude-opus-4-8 / medium | Nested `claude -p` summarizer, used only when Claude did not write the handoff itself |
 | `MAX_DOC_CHARS` | 200000 | Size limit of the handoff document (characters, ~50k tokens). Above it Claude is asked to condense it before staging (see "Checks before staging"). 0 = no limit |
+| `MAX_DOC_SHARE` | 25 | Lowers the size limit to this percent of `THRESHOLD` (tokens, ~4 characters each) when that is below `MAX_DOC_CHARS`: a 300k threshold keeps 200000 characters, a 40k one allows 40000. A fresh session starts at base context + document, so the document must leave it room to work. 0 = off |
+| `LOOP_GUARD` | true | A session whose first turn ends at or above `THRESHOLD` hands off only after growing by `LIVE_EVERY` (see "Loop protection"). `false` = off |
 | `STARTUP` | ignore | Fresh startup that finds another live session's staged handoff: `ignore` (inject a "not yours" note) or `adopt` |
 | `T3_AUTOCLEAR` | false | T3 layer, inside a T3 Code thread only (see "T3 Code"). The handoff-writing request goes to the thread as its own turn; once the handoff is staged the plugin continues **the same thread** in a fresh Claude session: T3 Code >= 0.1.9 gets one `/handoff:resume` sent as a fresh session (T3 records the new session itself); older T3 gets `/clear` + `/handoff:resume`, with the Claude session id T3 resumes aliased to the new session (so a T3 respawn cannot bring back the pre-clear context). `HANDOFF_T3_FRESH=false` (env) forces the older flow. Threads `/clear`ed by plugin <= 0.5 are recovered on their next message. Requires T3 Code (Beta) >= 0.1.0 and t3ctl. Off, or wherever the preflight fails: the base `/clear` + `/handoff:resume` path |
 | `T3_NUDGE_TURN` | true | With `T3_AUTOCLEAR`: `true` sends the handoff-writing request as its own turn; `false` uses the in-turn Stop nudge (the automatic /clear still runs). Flip it to compare while testing |
@@ -99,12 +101,24 @@ Before a complete document is staged (and, under T3, before the automatic handof
 * **Probable secrets**: private keys, `sk-…` API keys, GitHub (`ghp_…`, `github_pat_…`), AWS (`AKIA…`/`ASIA…`), Slack
   (`xox?-…`) and bearer tokens. The request already says not to copy secret values; a hit asks for a redaction naming
   the line.
-* **Size** over `MAX_DOC_CHARS` (200000 characters by default, room for long chains of handoffs): a request to condense,
+* **Size** over the limit: `MAX_DOC_CHARS` (200000 characters by default, room for long chains of handoffs), or
+  `MAX_DOC_SHARE` percent of `THRESHOLD` (25%, ~4 characters per token) when that is lower. A request to condense,
   keeping Standing instructions, Decisions log and Next steps complete.
 
 Up to two fix requests, then the document is staged anyway with a warning in the Stop message. Exception (Codex under
 T3): a document that still has probable secrets is not sent into the thread, since the message would keep them in T3's
 db; the Stop message says to redact and resume by hand.
+
+#### Loop protection
+
+A fresh session starts at its base context (system prompt, tools, instructions) plus the handoff document. If that is
+already near or over `THRESHOLD`, the first turn would trigger the next handoff, and every session after it the same.
+Two guards, for Claude and Codex:
+
+* **Size share**: the document limit shrinks with the threshold (`MAX_DOC_SHARE`, above), so the document leaves most
+  of the budget for work. Invisible at the default 300k threshold (200000 characters stays the lower limit).
+* **Loop guard** (`LOOP_GUARD`): a session whose first Stop is at or above the threshold does not hand off until it has
+  grown by `LIVE_EVERY` (20000 tokens) since then. A session that started below the threshold hands off as usual.
 
 At staging the plugin appends (and on every later staging rewrites) a **Workspace identity** section: directory, git
 branch, HEAD commit and uncommitted files (its own `.claude/handoff/` excluded). The resume instructions tell the next
@@ -285,8 +299,8 @@ turn ends ─Stop─▶ ctx (rollout token_count: last input + output) ≥ THRES
    │  file complete   → T3: `t3ctl threads send <thread> --fresh "<resume note + the document inline>"`; T3 starts a
    │                    new Codex session in the same thread and records it; the old session is tombstoned
    │                    elsewhere: "start a new session (/new) and resume from <file>" (skill: $handoff-resume)
-loop guard: a session hands off only after growing LIVE_EVERY since its first Stop (a fresh session that starts at or
-            above the threshold does not bounce straight into the next handoff)
+loop guard: a session whose first Stop is at or above the threshold hands off only after growing LIVE_EVERY (a fresh
+            session does not bounce straight into the next handoff; see "Loop protection")
 SessionStart(compact): Codex compacted anyway → the state restarts and the model is pointed at the session's document
 ```
 
@@ -319,7 +333,7 @@ Upgrade: `codex plugin marketplace upgrade claude-handoff` (git sources), `codex
 
 Configuration: Codex plugins have no userConfig, so the keys from "Configuration" go in `~/.codex/handoff.conf`
 (`KEY=VALUE`, `#` comments; `HANDOFF_CONF` overrides the path), per project in `.claude/handoff/codex.conf`; env
-`HANDOFF_<KEY>` still wins. Used: `THRESHOLD`, `LIVE_FROM`, `LIVE_EVERY`, `MAX_DOC_CHARS`, `T3_AUTOCLEAR`, `T3_NUDGE_TURN`, `T3_DEFER`,
+`HANDOFF_<KEY>` still wins. Used: `THRESHOLD`, `LIVE_FROM`, `LIVE_EVERY`, `MAX_DOC_CHARS`, `MAX_DOC_SHARE`, `LOOP_GUARD`, `T3_AUTOCLEAR`, `T3_NUDGE_TURN`, `T3_DEFER`,
 `T3_SEND_TIMEOUT`. Per project, `.claude/handoff/codex.conf` then `.claude/handoff/handoff.conf` override the global file. Example:
 
 ```

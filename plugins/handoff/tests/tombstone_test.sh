@@ -13,6 +13,7 @@ unset T3CODE_THREAD_ID   # T3 Code exports it to its agents; this suite may run 
 export CLAUDE_PROJECT_DIR="$TMP"
 export CLAUDE_HANDOFF_NESTED=""      # set-but-empty: lib guard sees it, no exit
 export HANDOFF_T3_AUTOCLEAR=false
+export HANDOFF_LOOP_GUARD=false HANDOFF_MAX_DOC_SHARE=0   # both covered in guards_test.sh
 HD="$TMP/.claude/handoff"
 # shellcheck disable=SC1090
 source "$SCR/handoff-lib.sh"

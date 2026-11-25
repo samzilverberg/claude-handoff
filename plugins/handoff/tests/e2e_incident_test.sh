@@ -9,6 +9,7 @@ bad() { FAIL=$((FAIL+1)); printf 'FAIL - %s\n' "$1"; [ -n "${2:-}" ] && printf '
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 unset T3CODE_THREAD_ID   # T3 Code exports it to its agents; this suite may run inside T3
+export HANDOFF_LOOP_GUARD=false HANDOFF_MAX_DOC_SHARE=0   # both covered in guards_test.sh
 export CLAUDE_PROJECT_DIR="$TMP" CLAUDE_HANDOFF_NESTED="" HANDOFF_T3_AUTOCLEAR=false HANDOFF_THRESHOLD=1
 HD="$TMP/.claude/handoff"
 # shellcheck disable=SC1090

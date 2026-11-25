@@ -1,6 +1,6 @@
 {
   "name": "handoff",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "Write a handoff document at the end of the turn that crosses a context threshold, stage it for the next context, and resume after /clear. Auto-compact stays a safeguard only.",
   "author": {
     "name": "Sam Zilverberg",
@@ -58,6 +58,20 @@
       "description": "Above this size Claude is asked to condense the handoff document before it is staged (up to 2 requests, then staged with a warning). 0 = no limit.",
       "default": 200000,
       "min": 0
+    },
+    "MAX_DOC_SHARE": {
+      "type": "number",
+      "title": "Handoff document size limit (% of THRESHOLD)",
+      "description": "Lowers the document size limit to this percent of THRESHOLD (tokens, ~4 characters each) when that is below MAX_DOC_CHARS, so a low threshold leaves the fresh session room to work before its own handoff. 25 = a 300k threshold keeps the 200000-character limit, a 40k one allows 40000 characters. 0 = off.",
+      "default": 25,
+      "min": 0,
+      "max": 100
+    },
+    "LOOP_GUARD": {
+      "type": "boolean",
+      "title": "Loop guard",
+      "description": "A session whose first turn ends at or above THRESHOLD (a big handoff document, a threshold below the fresh context's base size) hands off only after growing by LIVE_EVERY, instead of bouncing straight into the next handoff.",
+      "default": true
     },
     "STARTUP": {
       "type": "string",

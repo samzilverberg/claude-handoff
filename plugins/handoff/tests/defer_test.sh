@@ -10,6 +10,7 @@ check() { if eval "$2"; then ok "$1"; else bad "$1 ($2)"; fi; }
 
 W="$(mktemp -d -t handoff-defer)"; trap 'rm -rf "$W"' EXIT
 unset T3CODE_THREAD_ID HANDOFF_THRESHOLD HANDOFF_LIVE_FROM HANDOFF_T3_DEFER HANDOFF_MAX_DOC_CHARS
+export HANDOFF_LOOP_GUARD=false HANDOFF_MAX_DOC_SHARE=0   # both covered in guards_test.sh
 export HANDOFF_T3_AUTOCLEAR=true HANDOFF_CONF="$W/none.conf" HANDOFF_T3_SH="$W/t3stub.sh" CALLS="$W/calls"
 cat > "$HANDOFF_T3_SH" <<'EOS'
 #!/bin/bash

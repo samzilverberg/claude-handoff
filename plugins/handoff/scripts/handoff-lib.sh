@@ -60,13 +60,21 @@ secret_hits() {
     grep -nE -- "$re" "$f" 2>/dev/null | cut -d: -f1 | awk -v l="$label" '{print l " (line " $0 ")"}'
   done <<<"$SECRET_PATTERNS" | head -n 10
 }
-# doc_problems <file> -> one line per problem (empty = fine): probable secrets, size over MAX_DOC_CHARS (200000)
+# doc_problems <file> [threshold] -> one line per problem (empty = fine): probable secrets, size over the limit.
+# Size limit: MAX_DOC_CHARS (200000), lowered to MAX_DOC_SHARE percent (25) of the threshold (tokens, ~4 characters
+# each) when that is smaller. A fresh session starts at base context + document; a document near the threshold leaves
+# it no room to work before the next handoff, so the limit shrinks with low thresholds.
 doc_problems() {
-  local f="$1" max n hits; max="$(cfg MAX_DOC_CHARS 200000)"
+  local f="$1" thr="${2:-0}" max share cap n hits why="MAX_DOC_CHARS"
+  max="$(cfg MAX_DOC_CHARS 200000)"; max="${max%.*}"; share="$(cfg MAX_DOC_SHARE 25)"; share="${share%.*}"
+  if [ "${share:-0}" -gt 0 ] && [ "$thr" -gt 0 ]; then
+    cap=$((thr * share * 4 / 100))
+    if [ "$max" -le 0 ] || [ "$cap" -lt "$max" ]; then max="$cap"; why="MAX_DOC_SHARE: ${share}% of the ${thr}-token handoff threshold, ~4 characters per token"; fi
+  fi
   hits="$(secret_hits "$f" | paste -sd ',' - | sed 's/,/, /g')"
   [ -n "$hits" ] && echo "probable secrets: $hits. Replace each value with a placeholder that says what it was and where it lives (e.g. <GitHub token, from ~/.config/gh>), never the value."
   n="$(wc -c <"$f" | tr -d ' ')"
-  [ "$max" -gt 0 ] && [ "$n" -gt "$max" ] && echo "size: $n characters, over the limit of $max (MAX_DOC_CHARS). Condense it: keep Standing instructions, Decisions log and Next steps complete, shorten the narrative sections, and point to files or commits instead of pasting their content."
+  [ "$max" -gt 0 ] && [ "$n" -gt "$max" ] && echo "size: $n characters, over the limit of $max ($why). Condense it: keep Standing instructions, Decisions log and Next steps complete, shorten the narrative sections, and point to files or commits instead of pasting their content."
   return 0
 }
 
