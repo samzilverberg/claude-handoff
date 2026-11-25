@@ -74,8 +74,50 @@ refusal() {
   i="$(printf '%s' "$m" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p' | head -1)"
   m="${i:-$m}"; [ -n "$m" ] || m="$1"; printf '%s' "$m" | oneline
 }
-# Claude session id T3 has on record for a thread (empty when none or on a db error; see $DBERR)
-session_of_thread() { q "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from $V2T where thread_id='$1' order by updated_at desc limit 1"; }
+RUNS=orchestration_v2_projection_runs; MSGS=orchestration_v2_projection_messages; T3THR=orchestration_v2_projection_threads
+# session_of_thread <tid>: the Claude session T3 routes the thread's next user message to (empty when none or on a db
+# error; see $DBERR). A thread keeps one provider-thread row per session; a fresh session adds one. Neither the newest
+# updated_at, nor the thread's active pointer, nor the highest lastRunOrdinal is safe: a replaced session whose process
+# is still alive (background work) bumps its row, takes the active pointer back and (0.1.12) gets its wake runs
+# attributed to it whenever Claude wakes it (thread 569772de, 2026-11-24). T3 itself (0.1.12, #38824) routes a user
+# message to the newest session started at or after the thread's last fresh start: the highest ordinal of a run with
+# freshContext that is not queued, not cancelled before it started, and not started by a scheduled task. A wake can't
+# move that boundary and the replaced row started before it. Mirrored here: rows started at or after the boundary
+# (and not by a scheduled task's fresh run: T3 treats those as side conversations) first, then the active pointer, then lastRunOrdinal, then updated_at. Without the runs/threads tables (older T3,
+# tests) the ordinal and updated_at keys remain.
+T3SQL_MODE=""
+t3sql_mode() {
+  [ -n "$T3SQL_MODE" ] && return 0
+  local n; n="$(q "select (select count(*) from sqlite_master where name in ('$RUNS','$MSGS','$T3THR')) || ',' || (select count(*) from pragma_table_info('$V2T') where name='provider_thread_id')")"
+  case "$n" in "3,1") T3SQL_MODE=full;; *) T3SQL_MODE=basic;; esac
+}
+session_of_thread() {
+  t3sql_mode
+  if [ "$T3SQL_MODE" = full ]; then
+    q "with b as (select coalesce(max(r.ordinal),0) as o from $RUNS r left join $MSGS m on m.message_id=json_extract(r.payload_json,'\$.userMessageId')
+         where r.thread_id='$1' and json_extract(r.payload_json,'\$.freshContext')=1 and r.status<>'queued'
+           and not (r.status='cancelled' and json_extract(r.payload_json,'\$.startedAt') is null)
+           and json_extract(m.payload_json,'\$.scheduledTaskId') is null),
+       s as (select r.ordinal as o from $RUNS r join $MSGS m on m.message_id=json_extract(r.payload_json,'\$.userMessageId')
+         where r.thread_id='$1' and json_extract(r.payload_json,'\$.freshContext')=1 and json_extract(m.payload_json,'\$.scheduledTaskId') is not null)
+       select json_extract(p.payload_json,'\$.nativeThreadRef.nativeId') from $V2T p cross join b left join $T3THR t on t.thread_id=p.thread_id
+       where p.thread_id='$1'
+       order by (coalesce(json_extract(p.payload_json,'\$.firstRunOrdinal'),-1) >= b.o and coalesce(json_extract(p.payload_json,'\$.firstRunOrdinal'),-1) not in (select o from s)) desc,
+                (p.provider_thread_id = t.active_provider_thread_id) desc,
+                coalesce(json_extract(p.payload_json,'\$.lastRunOrdinal'),-1) desc, p.updated_at desc limit 1"
+  else
+    q "select json_extract(payload_json,'\$.nativeThreadRef.nativeId') from $V2T where thread_id='$1' order by coalesce(json_extract(payload_json,'\$.lastRunOrdinal'),-1) desc, updated_at desc limit 1"
+  fi
+}
+# active_session_of_thread <tid>: the session of the thread's active pointer: whose background work T3 checks before
+# it starts a fresh session (0.1.12: only the active pointer's process, not other live processes of the thread). Can
+# differ from session_of_thread when a replaced session's process took the pointer back. Basic layout: session_of_thread.
+active_session_of_thread() {
+  t3sql_mode
+  if [ "$T3SQL_MODE" = full ]; then
+    q "select json_extract(p.payload_json,'\$.nativeThreadRef.nativeId') from $T3THR t join $V2T p on p.provider_thread_id=t.active_provider_thread_id where t.thread_id='$1' limit 1"
+  else session_of_thread "$1"; fi
+}
 thread_json() { t3json threads list -i "$1" | jq -c '.[0] // empty' 2>/dev/null; }
 
 # plugin state (tombstones, logs) lives in the project's .claude/handoff; reuse the hook library for it
@@ -94,22 +136,38 @@ logq() { echo "$(date +%T) [t3] $*" >> "$LOG"; }
 if [ "$MODE" = "--bg" ]; then
   BMODE="$5"; TID="$6"; FILE="$7"; LIVE="${8:-$SID}"
   OUTCOME="$HANDOFF_DIR/state/$LIVE.t3clear"
-  deadline=$(( $(date +%s) + SEND_TIMEOUT ))
+  STARTED="$(date +%s)"
+  deadline=$(( STARTED + SEND_TIMEOUT ))
   WHYNOT=""   # why the last send_when_idle gave up (for the outcome)
-  BGASK=""; BGASKED=0   # fresh flow: ask the agent (once) to end background work T3 refuses a fresh session for
-  BGMARK="background agents or commands"   # T3's refusal text (0.1.9, 0.1.10)
+  PRESEND=""  # name of a check run right before each send: prints a reason when the send is no longer wanted
+  BGASK=""; BGASKED=0   # fresh flow: ask the agent (once per handoff) to end background work T3 refuses a fresh session for
+  BGMARK="background agents or commands"   # T3's refusal text (0.1.9 … 0.1.12)
+  BGASKF="$HANDOFF_DIR/state/$LIVE.bgask"   # the ask went out for this handoff (cap: one; t3.sh clear starts over)
   # ask_end_background <refusal>: one normal turn (no --fresh) asking the agent to stop background work it no longer
-  # needs; the fresh send is retried after that turn. Up to 3 attempts while the send itself is refused.
+  # needs; the fresh send is retried after that turn. Only when it reaches the session whose background work T3 checks:
+  # T3 routes the ask (a user message) to session_of_thread, and checks the background work of the active pointer's
+  # session (active_session_of_thread); both must be this session ($SID). Otherwise the ask lands in a session that has
+  # nothing to stop (thread 569772de: six asks went to the new session, which had none). At most one per handoff (one
+  # sent ask; up to 3 attempts while the ask itself cannot be sent).
   ask_end_background() {
-    local f="$HANDOFF_DIR/state/$LIVE.bgask.txt" out
+    local f="$HANDOFF_DIR/state/$LIVE.bgask.txt" out now act
+    if [ -e "$BGASKF" ]; then BGASKED=3; logq "request to end background work not repeated: already sent once for this handoff ($(cat "$BGASKF"))"; return 0; fi
+    now="$(session_of_thread "$TID")"; act="$(active_session_of_thread "$TID")"
+    if [ "$now" != "$SID" ]; then BGASKED=3; logq "request to end background work NOT sent to $TID: the thread maps to session '$now', not $SID whose fresh session T3 refused"; return 0; fi
+    if [ -n "$act" ] && [ "$act" != "$SID" ]; then
+      BGASKED=3; logq "request to end background work NOT sent to $TID: T3 refuses because of the background work of session $act (its active session pointer: an earlier session of the thread whose process is still alive), not of $SID; the fresh session can start once that work ends"
+      echo "pending: T3 refuses the fresh session while session $act, an earlier session of this thread whose process is still alive, runs background agents or commands (since $(date +%H:%M)); the plugin retries until ${SEND_TIMEOUT}s after scheduling" > "$OUTCOME"
+      return 0
+    fi
     printf '[handoff plugin] The handoff document is written and staged, but T3 Code will not start the fresh session for it while this session still runs background work (T3: "%s"). Stop the background agents, monitors and commands that are no longer needed (TaskStop; for a background shell, KillShell or kill). If one must finish first, say which one and why in one line and leave it running. Do not start new work. Then end your turn: the plugin retries the fresh session once this thread is idle.\n' "$1" > "$f"
-    out="$(t3 threads send "$TID" --stdin < "$f" 2>&1)" && { BGASKED=3; logq "asked the agent in $TID to end its background work (fresh session refused while it runs)"; return 0; }
+    out="$(t3 threads send "$TID" --stdin < "$f" 2>&1)" && { BGASKED=3; echo "session $SID, $(date +%T)" > "$BGASKF"; logq "asked the agent in $TID to end its background work (fresh session refused while it runs)"; return 0; }
     BGASKED=$((BGASKED+1)); logq "request to end background work not sent to $TID: $(printf '%s' "$out" | oneline)"
   }
-  # send_when_idle <what> <text-file> [t3ctl send flags…]: wait for idle, re-check the mapping, send; retry while
-  # busy (a run, or for --fresh: background agents/commands T3 will not end). 0 = sent.
+  # send_when_idle <what> <text-file> [t3ctl send flags…]: wait for idle, re-check the mapping (and $PRESEND), send;
+  # retry while busy (a run, or for --fresh: background agents/commands T3 will not end). 0 = sent, 2 = no longer
+  # wanted ($PRESEND; reason in WHYNOT), 1 = not sent.
   send_when_idle() {
-    local out left now rc what="$1" txt="$2" last=""; shift 2
+    local out left now rc what="$1" txt="$2" last="" why; shift 2
     while :; do
       left=$(( deadline - $(date +%s) ))
       if [ "$left" -le 0 ]; then
@@ -117,6 +175,7 @@ if [ "$MODE" = "--bg" ]; then
         logq "gave up after ${SEND_TIMEOUT}s: thread $TID never accepted $what${last:+ (last refusal: $last)}"; return 1
       fi
       out="$(t3 threads wait "$TID" --timeout "$left" 2>&1)" || logq "t3ctl threads wait $TID failed (rc=$?): $(printf '%s' "$out" | oneline)"
+      if [ -n "$PRESEND" ] && why="$($PRESEND)" && [ -n "$why" ]; then WHYNOT="$why"; return 2; fi
       now="$(session_of_thread "$TID")"
       if [ -z "$now" ]; then
         if [ -s "$DBERR" ]; then logq "cannot read T3 db $T3DB ($(dberr)); $1 NOT sent"; else logq "thread $TID has no Claude session in the T3 db anymore; $1 NOT sent"; fi
@@ -129,9 +188,32 @@ if [ "$MODE" = "--bg" ]; then
       # exit 7 = incompatible server (e.g. --fresh without freshContext): retrying cannot help
       [ $rc -eq 7 ] && { WHYNOT="T3 refused: $last"; logq "$what to $TID refused (incompatible server): $last"; return 1; }
       logq "$what to $TID failed (thread busy?): $last; retrying after the next idle"
-      case "$out" in *"$BGMARK"*) [ -n "$BGASK" ] && [ "$BGASKED" -lt 3 ] && ask_end_background "$last";; esac
+      case "$out" in *"$BGMARK"*)
+        if [ -n "$BGASK" ]; then
+          # tell the user too: the Stop hook's note shows the outcome while it is pending (ask_end_background may name
+          # another session instead)
+          grep -qs "^pending: T3 refuses" "$OUTCOME" || echo "pending: T3 refuses the fresh session while this session runs background agents or commands (since $(date +%H:%M)); stop them or press Stop, the plugin retries until ${SEND_TIMEOUT}s after scheduling" > "$OUTCOME"
+          [ "$BGASKED" -lt 3 ] && ask_end_background "$last"
+        fi;;
+      esac
       sleep 5
     done
+  }
+  # nudge_obsolete: the handoff-writing request is no longer wanted: the session was handed off, or the handoff itself
+  # got scheduled after this worker started (thread 569772de: a second Stop's nudge waited out the first nudge's turn and
+  # went out in the same second as the fresh /handoff:resume, re-running the request in the replaced session)
+  nudge_obsolete() {
+    is_tombstoned "$LIVE" && { echo "session $LIVE was already handed off"; return 0; }
+    [ "$FILE" = "$HANDOFF_DIR/state/$LIVE.nudge.txt" ] || return 0   # other turns (a held message released) still go
+    [ -e "$OUTCOME" ] && [ "$(mtime "$OUTCOME")" -ge "$STARTED" ] && echo "the handoff is already scheduled ($(head -c 100 "$OUTCOME" | oneline))"
+    return 0
+  }
+  # fresh_obsolete: the doc staged for the thread is gone before the fresh send: a compact (or a /clear) of the live
+  # session consumed it, so the context is small again and the fresh session would have nothing to adopt (thread
+  # 383ac993: the agent's background-work turn auto-compacted, then the worker kept retrying for 600s)
+  fresh_obsolete() {
+    [ -s "$BYTHREAD/$(printf '%s' "$TID" | tr '/' '_').md" ] || echo "the handoff document staged for thread $TID is gone (consumed by a compact or /clear of session $LIVE)"
+    return 0
   }
   case "$BMODE" in
     follow)
@@ -142,7 +224,10 @@ if [ "$MODE" = "--bg" ]; then
       else logq "WARNING: T3 still maps thread $TID to '$now', not the post-/clear session $SID: a respawn would resume the pre-clear context (no alias was made: T3 Code $FILE)"; fi
       exit 0 ;;
     nudge)
-      send_when_idle "handoff nudge" "$FILE" && logq "sent handoff nudge turn to $TID"; exit 0 ;;
+      PRESEND=nudge_obsolete; send_when_idle "handoff nudge" "$FILE"; rc=$?
+      [ $rc -eq 0 ] && logq "sent handoff nudge turn to $TID"
+      [ $rc -eq 2 ] && logq "handoff nudge to $TID dropped: $WHYNOT"
+      rm -f "$HANDOFF_DIR/state/$LIVE.nudge-pending"; exit 0 ;;
     fresh)
       if [ "$AGENT" = codex ]; then
         fail() { echo "failed:$1" > "$OUTCOME"; logq "codex handoff of $TID failed: $1"; exit 0; }
@@ -177,8 +262,10 @@ if [ "$MODE" = "--bg" ]; then
       # message is /handoff:resume itself) and writes state/cleared/<live sid> = its session id
       mkdir -p "$(dirname "$AUTO")"; echo "$LIVE" > "$AUTO"
       MARK="$HANDOFF_DIR/state/cleared/$LIVE"; rm -f "$MARK"
-      BGASK=1
-      if ! send_when_idle "fresh /handoff:resume" "$Rf" --fresh; then
+      BGASK=1; PRESEND=fresh_obsolete
+      send_when_idle "fresh /handoff:resume" "$Rf" --fresh; rc=$?
+      if [ $rc -eq 2 ]; then rm -f "$AUTO"; echo "cancelled:$WHYNOT" > "$OUTCOME"; logq "handoff of $TID cancelled, nothing sent: $WHYNOT"; exit 0; fi
+      if [ $rc -ne 0 ]; then
         case "$WHYNOT" in
           *"$BGMARK"*) fail "/handoff:resume in a fresh session not sent: $WHYNOT. Stop this session's background agents/commands first: T3 refuses a fresh session (the composer's /clear too) while they run" ;;
           *) fail "/handoff:resume in a fresh session not sent: $WHYNOT" ;;
@@ -328,6 +415,22 @@ if [ -z "$TID" ]; then
   skip "session $LOOK (and its pre-clear ancestors) not found in T3 state db $(basename "$T3DB")"
 fi
 
+# ---- recover gate: recover only a thread T3 still routes to this stale session ($MSID: the session itself, its alias
+# key, or a pre-clear ancestor). Anywhere else the prompt is a wake of (or stray input into) a replaced process that is
+# still alive: no recovery, nothing sent (thread 569772de: seven recoveries, six asks into the new session). Printed for
+# handoff-userprompt.sh, which logs (rate-limited) and blocks: REPLACED <session> successor|other.
+if [ "$MODE" = "recover" ]; then
+  CUR="$(session_of_thread "$TID")"
+  if [ "$CUR" != "$MSID" ]; then
+    REL=other; cur="$SID"; i=0
+    while [ $i -lt 20 ]; do cur="$(tombstone_get "$cur" continued_by)"; [ -n "$cur" ] || break; [ "$cur" = "$CUR" ] && { REL=successor; break; }; i=$((i+1)); done
+    echo "REPLACED ${CUR:-none} $REL $TID"; exit 0
+  fi
+  # a background-task notification Claude injects into the stale process is not the user's message: never recover
+  # with it (the fresh session would get it as the user's message); the next real message recovers the thread
+  case "$(head -c 40 "$ARG")" in "<task-notification>"*) echo "WAKE_STALE $TID"; exit 0;; esac
+fi
+
 # ---- alias: local only (runs inside SessionStart's 10 s)
 if [ "$MODE" = "alias" ]; then
   R="$MSID"; NEWT="$HANDOFF_TRANSCRIPT"
@@ -372,20 +475,27 @@ fi
 if [ "$FLOW" = fresh ] && [ "$AGENT" != codex ] && [ "$T3TID" != "$TID" ]; then FLOW=clear; FLOWWHY="this process's T3CODE_THREAD_ID $T3TID is not thread $TID"; FLOWDESC="handoff via /clear + alias ($FLOWWHY)"; fi
 [ "$MODE" = "check" ] && { say "ok: T3 Code $VER; session $SID -> thread $TID ($ST, matched by $HOW); $FLOWDESC"; exit 0; }
 
-bg() { nohup bash "$0" "$ROOT" "$LOG" "$MSID" --bg "$@" >/dev/null 2>&1 & disown 2>/dev/null || true; }
+bg() { nohup bash "$0" "$ROOT" "$LOG" "$MSID" --bg "$@" >/dev/null 2>&1 & BGPID=$!; disown 2>/dev/null || true; }
 
 case "$MODE" in
   nudge)
+    # one pending nudge worker per session and text file: a second Stop before the first nudge went out (a background
+    # task's turn ran in between) refreshes the text the pending worker sends instead of queueing a second turn
+    # (thread 569772de: the duplicate went out after the handoff was already written)
+    NP="$HANDOFF_DIR/state/$SID.nudge-pending"
+    if read -r PP PF 2>/dev/null < "$NP" && [ "$PF" = "$ARG" ] && nudge_pending "$SID" "$ARG"; then
+      say "nudge already scheduled for thread $TID (worker pid $PP, session $SID): not queued twice; it sends the current text"; exit 0
+    fi
     say "nudge scheduled for thread $TID (matched by $HOW, session $SID)"
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
-    bg nudge "$TID" "$ARG" ;;
+    bg nudge "$TID" "$ARG" "$SID"; echo "$BGPID $ARG" > "$NP" ;;
 
   clear)
     if [ "$AGENT" = codex ]; then say "handoff (document sent as a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
     elif [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
     else say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID; $FLOWWHY)"; fi
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
-    echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"
+    echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"; rm -f "$HANDOFF_DIR/state/$SID.bgask"   # a new handoff: its own ask
     # HANDOFF_RESUME_ARGS (T3_DEFER): file with the user's held-back message, passed on to the fresh session
     if [ "$AGENT" = codex ]; then bg fresh "$TID" "$ARG" "$SID"; else bg "$FLOW" "$TID" "${HANDOFF_RESUME_ARGS:-}" "$SID"; fi ;;
 

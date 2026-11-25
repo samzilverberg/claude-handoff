@@ -264,6 +264,13 @@ tombstone_link() {
   log tombstone "link sid=$1 -> $2"
 }
 
+# nudge_pending <sid> [file]: a T3 nudge worker (t3.sh nudge) for this session still waits to send <file> (default: the
+# handoff request, state/<sid>.nudge.txt); state/<sid>.nudge-pending = "<worker pid> <file>", removed by the worker
+nudge_pending() {
+  local p f; [ -f "$HANDOFF_DIR/state/$1.nudge-pending" ] || return 1; read -r p f < "$HANDOFF_DIR/state/$1.nudge-pending"
+  [ "$f" = "${2:-$HANDOFF_DIR/state/$1.nudge.txt}" ] && kill -0 "$p" 2>/dev/null && ps -o command= -p "$p" 2>/dev/null | grep -q 't3\.sh.* --bg nudge'
+}
+
 # --- deferred handoff (T3_DEFER, T3 layer only) ----------------------------------------------------------------------
 # off (default): the handoff runs right after the turn that crosses the threshold. resume: the document is written then,
 # but the fresh session waits for the user's next message. all: nothing at the turn end; the next message starts it

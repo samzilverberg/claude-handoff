@@ -122,7 +122,11 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff file is $( [ -s "$F" ] && echo "incomplete (missing: $(echo $MISSING | tr '\n' ' '))" || echo missing ); staged as-is. /clear will fall back to the transcript summarizer if needed." '{systemMessage:$m}'
     exit 0
   fi
-  state_set "$KEY" final_attempts "$((ATTEMPTS+1))"; state_set "$KEY" final_written_ctx "$CTX"
+  # a request whose T3 nudge turn has not gone out yet (a background task's turn ran first) is not a new attempt: the
+  # pending worker sends the refreshed text (t3.sh nudge does not queue a second turn)
+  if nudge_pending "$SID"; then log stop "handoff request not delivered yet (nudge worker pending): text refreshed, not counted as a new request"
+  else state_set "$KEY" final_attempts "$((ATTEMPTS+1))"; fi
+  state_set "$KEY" final_written_ctx "$CTX"
   if [ -s "$F" ] && [ -n "$MISSING" ]; then
     WHAT="The handoff document $F exists but is missing these sections: $(echo $MISSING | tr '\n' ', '). Add them (concrete content, not placeholders) and make sure the whole document reflects the current state."
   elif [ -s "$F" ]; then
