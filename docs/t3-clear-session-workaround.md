@@ -277,6 +277,65 @@ PR #24168 records the id Claude reports after `/clear`. With it, T3's R becomes 
 4. The plugin's preflight still requires T3 >= 0.1.0. Record which T3 version contains the fix there and in the
    README requirements.
 
+## Since 0.10.1: wakes of a replaced session, and which session a thread belongs to
+
+Incident (thread 569772de, 2026-11-24, T3 Code 0.1.11, plugin 0.7.2+). The fresh handoff completed at 18:01:27
+(5fc41362 → 5d8bc668; old session tombstoned and linked). The old Claude process stayed alive for its background
+agents, and Claude itself woke it with `<task-notification>` prompts (Claude-internal, not T3 sends; seen in its
+transcript as `queue-operation` enqueue/dequeue). Each hit `UserPromptSubmit` → tombstoned → `t3.sh recover`. Seven
+times between 18:01 and 18:18: a recovery doc re-staged per thread (the last one is still in `by-thread/`), a fresh
+`/handoff:resume` refused for background work, an "end your background work" turn sent to the thread, which T3 routed
+to the new session (no background work there; six such turns), then "thread now maps to 5d8bc668 … NOT sent".
+
+Root causes:
+1. Recovery ran for any prompt into a tombstoned session. It must only run when T3 still routes the thread to that
+   stale session (the pre-0.7 case it was built for).
+2. "The session T3 maps the thread to" was the provider-thread row with the newest `updated_at`. A thread has one row
+   per session; the old process's own events (task roster changes, turn ends, exit) bump its row and move the thread's
+   `active_provider_thread_id` back to it. That is why the mapping check passed for the old session at 18:03:15, the
+   fresh send went out and was refused, and the ask went out. After the old process exited (22:48), the db still names
+   the old session as both newest and active; the new session's own next handoff would have failed the mapping check.
+3. The ask turn went to whichever session T3 routes user messages to, not to the one with the background work.
+
+T3 Code 0.1.12, read from its bundle: a user message goes to the newest provider thread started at or after the
+thread's last fresh start (`contextBoundaryOrdinal`: highest ordinal of a run with `freshContext`, not queued, not
+cancelled before it started, not started by a scheduled task; rows started by a scheduled fresh run are side
+conversations). Wakes and fresh starts act on the active pointer; a wake run is attributed to the active pointer, so the
+old row's `lastRunOrdinal` can grow too. The fresh-session refusal checks only the active pointer's session. A
+provider wake turn whose prompt a hook blocks ends normally (empty task-notification result accepted, or a 2-minute
+deadline); no retry loop.
+
+0.10.1:
+- `session_of_thread` mirrors that routing rule in SQL (rows started at or after the boundary and not by a scheduled
+  fresh run, then the active pointer, then `lastRunOrdinal`, then `updated_at`). Checked against every multi-session
+  thread in the live db: equal to the active pointer everywhere except 569772de, where it names 5d8bc668, and the
+  scheduled-run Codex threads, where it follows T3's side-conversation rule.
+- `t3.sh recover` first checks it: thread routed to another session → `REPLACED <session> successor|other`, nothing
+  sent; the hook blocks the prompt (zero tokens), logs once per `WAKE_LOG_EVERY` (600 s) with a count. A stray real
+  message there is blocked with "send it again". A `<task-notification>` into a stale session T3 still routes to is
+  blocked too, without a recovery (it is not the user's message).
+- The background-work ask needs both: the thread routes to the refused session and T3's active pointer is on it.
+  Otherwise it is skipped and the pending outcome names the session holding the fresh start up. At most one ask per
+  handoff (`state/<sid>.bgask`; a new `t3.sh clear` resets it). The pending outcome ("pending: T3 refuses …") shows in
+  the Stop note, so the user sees why the handoff waits.
+- Thread 383ac993 (one ask followed by "gave up after 600s"): the ask turn auto-compacted the session, which consumed
+  the staged doc; the worker kept retrying a handoff that was no longer needed. The fresh worker now cancels when the
+  per-thread doc is gone. The second give-up there (11:28) was an agent that kept a background job running on
+  purpose; the pending note is all the plugin can add.
+- Nudge race (also 569772de): Stop at 18:00:05 scheduled a nudge; a task-notification turn ran before it went out;
+  that turn's Stop (18:00:17) scheduled a second nudge. The first went out at 18:00:20, the second waited for the next
+  idle and went out at 18:01:16, 0.2 s before the fresh `/handoff:resume` (T3 runs 12 and 13), so the request re-ran
+  in the session being replaced and re-published its doc. Now one pending nudge worker per session and text file
+  (`state/<sid>.nudge-pending`), the Stop does not count an undelivered request as an attempt, and a nudge still
+  waiting when the handoff gets scheduled (or the session is tombstoned) is dropped.
+
+Verified: `tests/wake_test.sh` (29 cases, a replay of 569772de on a db with T3's routing tables). Live on T3 Code
+0.1.12 (2026-11-25, scratch project, sonnet, threshold 66k): background `sleep 420` → nudge (one) → doc → fresh send
+refused 58 times → one ask (the agent kept the sleep as told) → sleep ends, Claude wakes the live session → fresh
+session adopted the doc in 1 s; runs: start, user turn, nudge, ask, wake, fresh; nothing else. T3 0.1.12 ended the old
+process at the fresh start, so no real wake of a replaced process happened; the installed hook fed three
+`<task-notification>` prompts as the old session against the live db: three blocks, one log line, nothing sent.
+
 ## Timeline
 
 - v0.4.0: `/clear` + `/handoff:resume` sent with t3ctl. Silently broken by T3's db move.
@@ -295,3 +354,10 @@ PR #24168 records the id Claude reports after `/clear`. With it, T3's R becomes 
 - v0.7.2 (2026-11-18): `SessionEnd(clear)` tombstones and bridges before the summarizer (Claude Code 2.1.327 killed
   the hook ~1 s into it, which lost the `/clear` chain); a fresh send refused for background work asks the agent once
   to stop it (the blocker seen in thread dbeea855, reproduced live). Verified live on 0.1.10.
+- v0.8.0 – v0.10.0: Codex support, `T3_DEFER`, loop guard, doc size limit (see README).
+- T3 Code 0.1.12 (2026-11-25): #38824 routes a user message to the newest session after the last fresh start, even
+  when a woken replaced session holds the active pointer; more wake sources (#30214, #40170, #37875).
+- v0.10.1 (2026-11-25): recovery only when T3 still routes the thread to the stale session; wakes of a replaced
+  session blocked and logged, nothing sent (thread 569772de); routing mirrors T3 0.1.12; background-work ask only to
+  the session T3 checks, once per handoff; fresh worker cancels when a compact consumed the doc (383ac993); no
+  duplicate nudge. Verified live on 0.1.12 (see above).
