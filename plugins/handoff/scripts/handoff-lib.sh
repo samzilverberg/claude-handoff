@@ -344,6 +344,13 @@ defer_on_prompt() {
 # session as /handoff:resume arguments. Files: state/manual/<sid>.json {at, model, effort, note}, state/<sid>.manual-note.txt.
 MANUAL_DIR="$HANDOFF_DIR/state/manual"
 EFFORTS="low medium high xhigh max ultrathink"
+# effort_word <token>: the effort a bare /handoff:now word means (short forms too), empty when it is none
+effort_word() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    low|lo) echo low;; medium|med|mid) echo medium;; high|hi) echo high;;
+    xhigh|x-high|extra-high|extrahigh|xhi) echo xhigh;; max|maximum) echo max;; ultrathink|ultra) echo ultrathink;;
+  esac
+}
 is_manual_prompt() { case "$1" in "/handoff:now"|"/handoff:now "*|"/handoff:now"$'\n'*|"/handoff:now"$'\t'*) return 0;; esac; return 1; }
 is_manual() { [ -f "$MANUAL_DIR/$1.json" ]; }
 manual_get() { local f="$MANUAL_DIR/$1.json"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null; return 0; }
@@ -372,12 +379,12 @@ manual_parse() {
       -m|--model|-e|--effort)
         [[ "$nxt" =~ $re ]] || break
         case "$tok" in -m|--model) MP_MODEL="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"; join_version; continue;;
-          *) MP_EFFORT="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')";; esac
+          *) MP_EFFORT="$(effort_word "${BASH_REMATCH[1]}")"; [ -n "$MP_EFFORT" ] || MP_EFFORT="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')";; esac
         rest="${BASH_REMATCH[2]}"; continue;;
       --model=*) MP_MODEL="${tok#*=}";;
-      --effort=*) MP_EFFORT="$(printf '%s' "${tok#*=}" | tr '[:upper:]' '[:lower:]')";;
+      --effort=*) MP_EFFORT="$(effort_word "${tok#*=}")"; [ -n "$MP_EFFORT" ] || MP_EFFORT="$(printf '%s' "${tok#*=}" | tr '[:upper:]' '[:lower:]')";;
       *)
-        if [ -z "$MP_EFFORT" ] && [[ " $EFFORTS " == *" $lc "* ]]; then MP_EFFORT="$lc"
+        if [ -z "$MP_EFFORT" ] && [ -n "$(effort_word "$lc")" ]; then MP_EFFORT="$(effort_word "$lc")"
         elif [ -z "$MP_MODEL" ] && looks_like_model "$lc"; then MP_MODEL="$tok"; rest="$nxt"; join_version; continue
         else break; fi;;
     esac

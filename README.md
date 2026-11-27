@@ -388,7 +388,8 @@ Opus/high for the design, Sonnet/medium for the mechanical part) without draggin
 /handoff:now -m claudeAgent/claude-fable-5-2 -e high -- high-risk part next   explicit flags; `--` starts the note
 ```
 
-Arguments: leading tokens are read as an effort (`low` `medium` `high` `xhigh` `max` `ultrathink`), a model (`opus`,
+Arguments: leading tokens are read as an effort (`low` `medium` `high` `xhigh` `max` `ultrathink`; also `lo`, `mid`/`med`,
+`hi`, `x-high`, `maximum`, `ultra`), a model (`opus`,
 `sonnet`, `haiku`, `fable`, `claude-…`, `<instance>/<model>`) or the flags `-m/--model`, `-e/--effort`; the first other
 word, or `--`, starts the note, kept verbatim. A version right after the model joins it (`opus 4.8` = `opus-4.8`).
 Models resolve against `t3ctl models` (T3's catalog): your own aliases in `~/.config/t3ctl/config.json`

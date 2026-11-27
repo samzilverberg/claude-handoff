@@ -68,6 +68,10 @@ check "parse: effort first, fable 5"       '[ "$(parse " high fable 5")" = "fabl
 check "parse: -m with a separate version"  '[ "$(parse " -m opus 4.8 -e max")" = "opus-4.8|max|" ]'
 check "parse: a number after an effort is the note" '[ "$(parse " low 5 things")" = "|low|5 things" ]'
 check "parse: -- keeps a model-like note"  '[ "$(parse " -- opus 5 is great")" = "||opus 5 is great" ]'
+check "parse: opus 5.5 high"               '[ "$(parse " opus 5.5 high")" = "opus-5.5|high|" ]'
+check "parse: fable 5.2 mid -> medium"     '[ "$(parse " fable 5.2 mid")" = "fable-5.2|medium|" ]'
+check "parse: fable5 mid -> medium"        '[ "$(parse " fable5 mid")" = "fable5|medium|" ]'
+check "parse: short efforts (med/hi/lo/ultra/x-high/maximum)" '[ "$(parse " med")" = "|medium|" ] && [ "$(parse " hi")" = "|high|" ] && [ "$(parse " lo")" = "|low|" ] && [ "$(parse " ultra")" = "|ultrathink|" ] && [ "$(parse " x-high")" = "|xhigh|" ] && [ "$(parse " -e maximum")" = "|max|" ]'
 check "parse: multi-line note kept"        '[ "$(parse " low first line
 second line")" = "|low|first line
 second line" ]'
