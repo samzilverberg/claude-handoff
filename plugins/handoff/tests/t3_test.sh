@@ -57,6 +57,8 @@ case "$1 $2" in
                     {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-5","aliases":"opus-5,claude-opus-5-0","effort":"low|high"},
                     {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-4-8","aliases":"opus*,opus-4.8","effort":"low|high"},
                     {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-4-7","aliases":"opus-4.7","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-sonnet-5","aliases":"sonnet-5,claude-sonnet-5-0","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-sonnet-4-6","aliases":"sonnet*,sonnet-4.6","effort":"low|high"},
                     {"instanceId":"codex","provider":"Codex","model":"gpt-6.2-sol","aliases":"","effort":"low|high"}]'; exit 0;;
   "threads send") [ -e "$T3_FAKE_BUSY" ] && { echo "thread is running" >&2; exit 1; }
                   case " $* " in *" --fresh "*)
@@ -359,10 +361,13 @@ mres nope "" | grep -q '^error: unknown model "nope"' && ok "N2: unknown model" 
 # (wins over T3's opus-5 = 5.0 alias), major.minor = exact
 for c in "opus claude-opus-5-5" "opus5 claude-opus-5-5" "opus-5 claude-opus-5-5" "opus4 claude-opus-4-8" "opus-4 claude-opus-4-8" \
          "opus-4.8 claude-opus-4-8" "opus4.8 claude-opus-4-8" "Opus-4.7 claude-opus-4-7" "opus-5.0 claude-opus-5" "claude-opus-5-0 claude-opus-5" \
-         "fable claude-fable-5-2" "fable5 claude-fable-5-2" "fable-5.1 claude-fable-5-1" "fable-5.0 claude-fable-5"; do
+         "fable claude-fable-5-2" "fable5 claude-fable-5-2" "fable-5.1 claude-fable-5-1" "fable-5.0 claude-fable-5" \
+         "sonnet claude-sonnet-5-5" "sonnet5 claude-sonnet-5-5" "sonnet-5 claude-sonnet-5-5" "sonnet-5.5 claude-sonnet-5-5" \
+         "sonnet-5.0 claude-sonnet-5" "sonnet4 claude-sonnet-4-6" "sonnet-4.6 claude-sonnet-4-6"; do
   set -- $c; [ "$(mres "$1" "")" = "ok claudeAgent/$2 -" ] && ok "N2: $1 -> $2" || bad "N2: $1" "$(mres "$1" "")"
 done
 mres opus-4.9 "" | grep -q '^error: unknown model "opus-4.9"' && ok "N2: missing minor version is unknown" || bad "N2: opus-4.9" "$(mres opus-4.9 "")"
+mres sonnet-4.5 "" | grep -q '^error: unknown model "sonnet-4.5"' && ok "N2: sonnet-4.5 unknown" || bad "N2: sonnet-4.5" "$(mres sonnet-4.5 "")"
 mres opus3 "" | grep -q '^error: unknown model "opus3"' && ok "N2: missing series is unknown" || bad "N2: opus3" "$(mres opus3 "")"
 [ "$(mres claude-haiku-4-5 xhigh)" = "ok claudeAgent/claude-haiku-4-5 xhigh" ] && ok "N2: model without an effort list: effort left to T3" || bad "N2: no list" "$(mres claude-haiku-4-5 xhigh)"
 
