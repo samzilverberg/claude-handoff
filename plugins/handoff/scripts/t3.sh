@@ -345,8 +345,19 @@ if [ "$MODE" = model ]; then
          (($ual | with_entries(.key |= norm))[$m|norm] // $m) as $m2
          | (if ($m2|test("/")) then ($m2|split("/")) else [null,$m2] end) as $p0
          | [(if $p0[0] then ($p0[0]|ascii_downcase) else null end), ($p0[1]|norm)] as $p
-         | [$cat[] | select($p[0]==null or (.instanceId|ascii_downcase)==$p[0])
-                   | select(names as $n | ($n|index($p[1])) != null or ($n|index("claude-"+$p[1])) != null)] as $hits
+         | [$cat[] | select($p[0]==null or (.instanceId|ascii_downcase)==$p[0])] as $cands
+         # family [major[.minor]]: opus = newest Opus; opus5 / opus-5 = newest Opus 5.x; opus-4-8 = 4.8 exactly;
+         # opus-5-0 = 5.0. Checked before the catalog aliases (T3 has opus-5 = 5.0 exactly; here a bare major is a series).
+         | ([$p[1] | capture("^(claude-)?(?<f>[a-z]+)-?(?<maj>[0-9]+)?(-(?<min>[0-9]{1,2}))?$")] | .[0]) as $fv
+         | (if $fv == null then [] else
+              [$cands[] | ([.model | capture("^claude-(?<f>[a-z]+)-(?<maj>[0-9]+)(-(?<min>[0-9]{1,2}))?$")] | .[0]) as $v
+                | select($v != null and $v.f == $fv.f and ($fv.maj == null or $v.maj == $fv.maj)
+                         and ($fv.min == null or (($v.min // "0")|tonumber) == ($fv.min|tonumber)))
+                | . + {_k: [($v.maj|tonumber), (($v.min // "0")|tonumber)]}]
+              | sort_by(._k) | reverse | map(del(._k))
+            end) as $fam
+         | [$cands[] | select(names as $n | ($n|index($p[1])) != null or ($n|index("claude-"+$p[1])) != null)] as $ali
+         | (if ($fam|length) > 0 then $fam else $ali end) as $hits
          | {hit: (($hits|map(select(.instanceId==$ci))) + $hits | .[0]), keep: false}
        end) as $res
     | $res.hit as $h

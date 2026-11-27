@@ -357,23 +357,28 @@ manual_desc() {
 # looks_like_model <lowercase token>: a bare /handoff:now argument meant as a model (validated later where possible)
 looks_like_model() { case "$1" in */*|claude-*|opus*|sonnet*|haiku*|fable*|gpt-*|codex*) return 0;; esac; return 1; }
 # manual_parse <args>: sets MP_MODEL, MP_EFFORT, MP_NOTE. Leading tokens: -m/--model X, -e/--effort X, an effort word,
-# a model-looking token; the first other token (or `--`) starts the note, kept verbatim.
+# a model-looking token; the first other token (or `--`) starts the note, kept verbatim. A version right after the model
+# joins it ("opus 4.8" -> opus-4.8, "opus 5" -> opus-5; t3.sh model resolves family and version).
 manual_parse() {
-  local rest="$1" tok nxt lc re='^[[:space:]]*([^[:space:]]+)(.*)$'
+  local rest="$1" tok nxt lc re='^[[:space:]]*([^[:space:]]+)(.*)$' ver='^[vV]?([0-9]+([._-][0-9]+)?)$'
   MP_MODEL=""; MP_EFFORT=""; MP_NOTE=""
+  # join_version: MP_MODEL takes the version token at the start of $rest, if any
+  join_version() { [[ "$rest" =~ $re ]] && [[ "${BASH_REMATCH[1]}" =~ $ver ]] || return 0
+    local v="${BASH_REMATCH[1]}"; [[ "$rest" =~ $re ]]; MP_MODEL="$MP_MODEL-$v"; rest="${BASH_REMATCH[2]}"; }
   while [[ "$rest" =~ $re ]]; do
     tok="${BASH_REMATCH[1]}"; nxt="${BASH_REMATCH[2]}"; lc="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
     case "$tok" in
       --) rest="$nxt"; break;;
       -m|--model|-e|--effort)
         [[ "$nxt" =~ $re ]] || break
-        case "$tok" in -m|--model) MP_MODEL="${BASH_REMATCH[1]}";; *) MP_EFFORT="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')";; esac
+        case "$tok" in -m|--model) MP_MODEL="${BASH_REMATCH[1]}"; rest="${BASH_REMATCH[2]}"; join_version; continue;;
+          *) MP_EFFORT="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')";; esac
         rest="${BASH_REMATCH[2]}"; continue;;
       --model=*) MP_MODEL="${tok#*=}";;
       --effort=*) MP_EFFORT="$(printf '%s' "${tok#*=}" | tr '[:upper:]' '[:lower:]')";;
       *)
         if [ -z "$MP_EFFORT" ] && [[ " $EFFORTS " == *" $lc "* ]]; then MP_EFFORT="$lc"
-        elif [ -z "$MP_MODEL" ] && looks_like_model "$lc"; then MP_MODEL="$tok"
+        elif [ -z "$MP_MODEL" ] && looks_like_model "$lc"; then MP_MODEL="$tok"; rest="$nxt"; join_version; continue
         else break; fi;;
     esac
     rest="$nxt"
@@ -401,7 +406,7 @@ manual_arm() {
         "ok "*) read -r _ m e <<<"$R";;
         "error: "*)
           log manual "not armed (sid=$sid): $R"
-          jq -nc --arg r "Handoff plugin: /handoff:now not run: ${R#error: }. Usage: /handoff:now [model] [effort] [note]." '{decision:"block", reason:$r}'
+          jq -nc --arg r "Handoff plugin: /handoff:now not run: ${R#error: }. Usage: /handoff:now [model] [effort] [note]; put -- before a note whose first words were read as a model or version." '{decision:"block", reason:$r}'
           return 0;;
         *) warn=" Model/effort not checked (${R#skip: }); T3 checks them when it starts the fresh session.";;
       esac

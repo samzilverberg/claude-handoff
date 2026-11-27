@@ -51,6 +51,12 @@ case "$1 $2" in
   "models ") echo '[{"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-5-5","aliases":"opus,opus-5.5","effort":"low|medium*|high|xhigh|max"},
                     {"instanceId":"claudeAgent","provider":"Claude","model":"claude-sonnet-5-5","aliases":"sonnet,sonnet-5.5","effort":"low|medium*|high"},
                     {"instanceId":"claudeAgent","provider":"Claude","model":"claude-haiku-4-5","aliases":"","effort":""},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-fable-5-2","aliases":"fable,fable-5.2","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-fable-5-1","aliases":"fable*,fable-5.1","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-fable-5","aliases":"","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-5","aliases":"opus-5,claude-opus-5-0","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-4-8","aliases":"opus*,opus-4.8","effort":"low|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-4-7","aliases":"opus-4.7","effort":"low|high"},
                     {"instanceId":"codex","provider":"Codex","model":"gpt-6.2-sol","aliases":"","effort":"low|high"}]'; exit 0;;
   "threads send") [ -e "$T3_FAKE_BUSY" ] && { echo "thread is running" >&2; exit 1; }
                   case " $* " in *" --fresh "*)
@@ -349,6 +355,15 @@ mres "" ultra | grep -q '^error: effort "ultra" is not offered by claude-opus-5-
 mres sonnet max | grep -q '^error: effort "max" is not offered by claude-sonnet-5-5' && ok "N2: bad effort for the new model" || bad "N2: bad effort new" "$(mres sonnet max)"
 mres gpt-6.2-sol "" | grep -q "^error: gpt-6.2-sol runs on provider Codex" && ok "N2: other provider refused" || bad "N2: provider" "$(mres gpt-6.2-sol "")"
 mres nope "" | grep -q '^error: unknown model "nope"' && ok "N2: unknown model" || bad "N2: unknown" "$(mres nope "")"
+# family [major[.minor]] (manual_parse joins "opus 4.8" to opus-4.8): bare family = newest, major = newest of that series
+# (wins over T3's opus-5 = 5.0 alias), major.minor = exact
+for c in "opus claude-opus-5-5" "opus5 claude-opus-5-5" "opus-5 claude-opus-5-5" "opus4 claude-opus-4-8" "opus-4 claude-opus-4-8" \
+         "opus-4.8 claude-opus-4-8" "opus4.8 claude-opus-4-8" "Opus-4.7 claude-opus-4-7" "opus-5.0 claude-opus-5" "claude-opus-5-0 claude-opus-5" \
+         "fable claude-fable-5-2" "fable5 claude-fable-5-2" "fable-5.1 claude-fable-5-1" "fable-5.0 claude-fable-5"; do
+  set -- $c; [ "$(mres "$1" "")" = "ok claudeAgent/$2 -" ] && ok "N2: $1 -> $2" || bad "N2: $1" "$(mres "$1" "")"
+done
+mres opus-4.9 "" | grep -q '^error: unknown model "opus-4.9"' && ok "N2: missing minor version is unknown" || bad "N2: opus-4.9" "$(mres opus-4.9 "")"
+mres opus3 "" | grep -q '^error: unknown model "opus3"' && ok "N2: missing series is unknown" || bad "N2: opus3" "$(mres opus3 "")"
 [ "$(mres claude-haiku-4-5 xhigh)" = "ok claudeAgent/claude-haiku-4-5 xhigh" ] && ok "N2: model without an effort list: effort left to T3" || bad "N2: no list" "$(mres claude-haiku-4-5 xhigh)"
 
 # --- O. fresh send refused while background work runs: retried, then named ---------------------------------------

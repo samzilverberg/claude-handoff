@@ -390,9 +390,22 @@ Opus/high for the design, Sonnet/medium for the mechanical part) without draggin
 
 Arguments: leading tokens are read as an effort (`low` `medium` `high` `xhigh` `max` `ultrathink`), a model (`opus`,
 `sonnet`, `haiku`, `fable`, `claude-…`, `<instance>/<model>`) or the flags `-m/--model`, `-e/--effort`; the first other
-word, or `--`, starts the note, kept verbatim. Models resolve against `t3ctl models` (T3's catalog): your own aliases in
-`~/.config/t3ctl/config.json` (`modelAliases`) first, then the catalog's aliases (`opus` → the newest Opus T3 offers),
-with `.`/`_` read as `-`. t3ctl's built-in aliases are not used: they lag behind the catalog (t3ctl 0.8.0 maps `opus` to
+word, or `--`, starts the note, kept verbatim. A version right after the model joins it (`opus 4.8` = `opus-4.8`).
+Models resolve against `t3ctl models` (T3's catalog): your own aliases in `~/.config/t3ctl/config.json`
+(`modelAliases`) first, then family and version, then the catalog's aliases and slugs, with `.`/`_` read as `-`:
+
+| You type | Runs on (catalog of 2026-11-27) |
+| --- | --- |
+| `opus`, `opus high` | newest Opus: `claude-opus-5-5` |
+| `opus5`, `opus 5`, `opus-5` | newest Opus 5.x: `claude-opus-5-5` (T3's own alias `opus-5` means 5.0; here a bare major is a series) |
+| `opus4`, `opus 4` | newest Opus 4.x: `claude-opus-4-8` |
+| `opus 4.8`, `opus-4.8`, `opus4.8`, `claude-opus-4-8` | exactly `claude-opus-4-8` |
+| `opus 5.0` | exactly `claude-opus-5` |
+| `fable`, `fable5` / `fable 5.1` / `fable 5.0` | `claude-fable-5-2` / `claude-fable-5-1` / `claude-fable-5` |
+| `opus 4.9`, `opus3` | blocked: unknown model (the message lists what exists) |
+
+The same rule holds for every family (`sonnet`, `haiku`, …). A number right after the model is always read as its
+version: `/handoff:now opus 3 tests left` is blocked as `opus-3`; write `/handoff:now opus -- 3 tests left`. t3ctl's built-in aliases are not used: they lag behind the catalog (t3ctl 0.8.0 maps `opus` to
 `claude-opus-4-8`, `sonnet` to `claude-sonnet-4-6`). The resolved `<instance>/<model>` is what gets sent. A user alias
 that does not look like a model name needs `-m` (`/handoff:now -m quick`).
 
