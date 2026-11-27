@@ -43,31 +43,40 @@ emit_nudge() {
   fi
 }
 
+# /handoff:now (manual_arm in handoff-lib.sh): this session hands off now, whatever its size. The document counts once it
+# was (re)written after the arming; HEAD opens every message of the handoff branch.
+MANUAL=""; MAN_AT=0
+if is_manual "$SID"; then MANUAL=1; MAN_AT="$(manual_get "$SID" at)"; MAN_AT="${MAN_AT:-0}"; fi
+if [ -n "$MANUAL" ]; then HEAD="Handoff (/handoff:now$(manual_desc "$SID")): context is ${CTX} tokens."
+else HEAD="Handoff: context is ${CTX} tokens (limit ${THR})."; fi
+
 # Loop guard: a session that starts at or above the threshold (a big handoff document, a threshold below the fresh
 # context's base size) would hand off again at once, every session. Such a session (first Stop at or above the
 # threshold) hands off only after growing by LIVE_EVERY since that first Stop, unless a handoff is already under way
 # (final_written_ctx set). LOOP_GUARD=false turns it off. first_ctx is per session id.
 FIRST="$(state_get "$SID" first_ctx)"; [ -n "$FIRST" ] || { FIRST="$CTX"; state_set "$SID" first_ctx "$CTX"; }
-if [ "$(cfg LOOP_GUARD true)" = true ] && [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ] && [ "$FIRST" -ge "$THR" ] && [ -z "$(state_get "$KEY" final_written_ctx)" ] && [ $((CTX - FIRST)) -lt "$LIVE_EVERY" ]; then
+if [ -z "$MANUAL" ] && [ "$(cfg LOOP_GUARD true)" = true ] && [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ] && [ "$FIRST" -ge "$THR" ] && [ -z "$(state_get "$KEY" final_written_ctx)" ] && [ $((CTX - FIRST)) -lt "$LIVE_EVERY" ]; then
   log stop "ctx $CTX >= thr $THR but the session started at $FIRST (< $LIVE_EVERY growth): no handoff yet"
   exit 0
 fi
 
-# ---- final handoff at threshold
-if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
+# ---- final handoff at threshold (or asked for with /handoff:now)
+if [ -n "$MANUAL" ] || { [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; }; then
   ATTEMPTS="$(state_get "$KEY" final_attempts)"; ATTEMPTS="${ATTEMPTS:-0}"
   FINAL_AT="$(state_get "$KEY" final_written_ctx)"
   MISSING=""; [ -s "$F" ] && MISSING="$(missing_sections "$F")"
   # Complete handoff exists but the user kept working without /clear: once the context grew by LIVE_EVERY since the
   # last write, ask for a refresh instead of restaging a stale document.
   PUB_AT="$(state_get "$KEY" pub_ctx)"
-  if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$PUB_AT" ] && [ "$ACTIVE" != "true" ] && [ $((CTX - PUB_AT)) -ge "$LIVE_EVERY" ]; then
+  if [ -z "$MANUAL" ] && [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$PUB_AT" ] && [ "$ACTIVE" != "true" ] && [ $((CTX - PUB_AT)) -ge "$LIVE_EVERY" ]; then
     state_set "$KEY" final_written_ctx "$CTX"
     emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}), ${LIVE_EVERY}+ tokens past the last handoff. Asking Claude to refresh the handoff document. Then /clear (under T3 Code with T3_AUTOCLEAR the plugin does that by itself)." \
                "The context window is at ${CTX} tokens, past the handoff limit of ${THR}, and the handoff document $F is out of date. Before stopping: update it so every section reflects the current state (overwrite with Write; Standing instructions and Decisions log are append-only, add new entries and re-tag old ones). ${SECTIONS} Then stop; do not continue the task."
     exit 0
   fi
-  if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$FINAL_AT" ]; then
+  # ready: complete, and requested in this session (threshold) or written after /handoff:now armed it (manual)
+  READY=""; if [ -n "$MANUAL" ]; then [ "$(mtime "$F")" -ge "$MAN_AT" ] && READY=1; else [ -n "$FINAL_AT" ] && READY=1; fi
+  if [ -s "$F" ] && [ -z "$MISSING" ] && [ -n "$READY" ]; then
     [ "$ACTIVE" = "true" ] && state_set "$KEY" final_written_ctx "$CTX"
     # document checks before the first staging (doc_problems: probable secrets, size): up to 2 fix requests, then
     # staged anyway with a warning
@@ -93,33 +102,37 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
     if [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ "$(state_get "$KEY" t3_clear)" = "1" ]; then
       RS="$(cat "$HANDOFF_DIR/state/$SID.t3clear" 2>/dev/null)"
       case "$RS" in
-        failed:*) jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
-        *)        jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
+        failed:*) jq -nc --arg m "${HEAD}${DW} Handoff staged, but the automatic T3 handoff failed (${RS#failed:}). Type /clear, then /handoff:resume." '{systemMessage:$m}';;
+        *)        jq -nc --arg m "${HEAD}${DW} Handoff staged; the automatic T3 handoff is already scheduled (${RS:-pending}; see hooks.log [t3])." '{systemMessage:$m}';;
       esac
-    elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && is_armed "$SID"; then
-      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER: that message runs there)." '{systemMessage:$m}'
-    elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ -z "$(pending_prompt "$SID")" ] && [ "$(t3_defer)" = resume ] && defer_arm "$SID" resume; then
-      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER=resume: that message runs there)." '{systemMessage:$m}'
+    elif [ -z "$MANUAL" ] && [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && is_armed "$SID"; then
+      jq -nc --arg m "${HEAD}${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER: that message runs there)." '{systemMessage:$m}'
+    elif [ -z "$MANUAL" ] && [ "$(cfg T3_AUTOCLEAR false)" = "true" ] && [ -z "$(pending_prompt "$SID")" ] && [ "$(t3_defer)" = resume ] && defer_arm "$SID" resume; then
+      jq -nc --arg m "${HEAD}${DW} Handoff staged; this thread continues in a fresh session when you send your next message (T3_DEFER=resume: that message runs there)." '{systemMessage:$m}'
     elif [ "$(cfg T3_AUTOCLEAR false)" = "true" ]; then
       # T3_DEFER: a held message (pending prompt) goes into the fresh session as /handoff:resume arguments
-      R="$(HANDOFF_RESUME_ARGS="$(pending_prompt "$SID")" bash "$T3SH" "$ROOT" "$LOG" "$SID" clear "$F")"
+      # /handoff:now: the user's note and the model / effort go to the fresh session
+      RA="$(pending_prompt "$SID")"; [ -n "$MANUAL" ] && [ -s "$HANDOFF_DIR/state/$SID.manual-note.txt" ] && RA="$HANDOFF_DIR/state/$SID.manual-note.txt"
+      R="$(HANDOFF_RESUME_ARGS="$RA" HANDOFF_FRESH_MODEL="$(manual_get "$SID" model)" HANDOFF_FRESH_EFFORT="$(manual_get "$SID" effort)" bash "$T3SH" "$ROOT" "$LOG" "$SID" clear "$F")"
       case "$R" in
         *"fresh session) scheduled"*) state_set "$KEY" t3_clear 1
-                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
+                     jq -nc --arg m "${HEAD}${DW} Handoff staged; once this turn ends the plugin sends /handoff:resume to this thread in a fresh session (T3 starts a new Claude session in the same thread). ${R}" '{systemMessage:$m}';;
         *scheduled*) state_set "$KEY" t3_clear 1
-                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
+                     jq -nc --arg m "${HEAD}${DW} Handoff staged; once this turn ends the plugin sends /clear and /handoff:resume to this thread. ${R}" '{systemMessage:$m}';;
         *)           release_held_prompt "$SID" "automatic handoff skipped"
-                     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
+                     jq -nc --arg m "${HEAD}${DW} Handoff staged. Automatic T3 handoff skipped (${R:-no reason}); type /clear, then /handoff:resume." '{systemMessage:$m}';;
       esac
     else
-      jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}).${DW} Handoff for this session is written and staged. Type /clear, then /handoff:resume (under T3 Code, T3_AUTOCLEAR does this automatically)." '{systemMessage:$m}'
+      MX=""; [ -n "$MANUAL" ] && [ -s "$HANDOFF_DIR/state/$SID.manual-note.txt" ] && MX=" To pass your /handoff:now note on, add it after /handoff:resume."
+      jq -nc --arg m "${HEAD}${DW} Handoff for this session is written and staged. Type /clear, then /handoff:resume (under T3 Code, T3_AUTOCLEAR does this automatically).${MX}" '{systemMessage:$m}'
     fi
+    manual_done "$SID" staged
     exit 0
   fi
   if [ "$ATTEMPTS" -ge 2 ]; then
     [ -s "$F" ] && publish "$F" "$SID"
-    release_held_prompt "$SID" "no complete handoff document after 2 requests"
-    jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff file is $( [ -s "$F" ] && echo "incomplete (missing: $(echo $MISSING | tr '\n' ' '))" || echo missing ); staged as-is. /clear will fall back to the transcript summarizer if needed." '{systemMessage:$m}'
+    release_held_prompt "$SID" "no complete handoff document after 2 requests"; manual_done "$SID" "no document after 2 requests"
+    jq -nc --arg m "${HEAD} Handoff file is $( [ -s "$F" ] && echo "incomplete (missing: $(echo $MISSING | tr '\n' ' '))" || echo missing ); staged as-is. /clear will fall back to the transcript summarizer if needed." '{systemMessage:$m}'
     exit 0
   fi
   # a request whose T3 nudge turn has not gone out yet (a background task's turn ran first) is not a new attempt: the
@@ -134,13 +147,15 @@ if [ "$THR" -gt 0 ] && [ "$CTX" -ge "$THR" ]; then
   else
     WHAT="Write the handoff document with the Write tool to $F."
   fi
-  REQ="The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task."
+  if [ -n "$MANUAL" ]; then REQ="The user asked to hand this conversation off now (/handoff:now). This conversation"
+  else REQ="The context window is at ${CTX} tokens, past the handoff limit of ${THR}. This conversation"; fi
+  REQ="${REQ} will continue in a fresh context that sees only the repo and a handoff document. Before stopping: ${WHAT} ${SECTIONS} Then stop; do not continue the task."
   # T3_DEFER=all: nothing now; the user's next message starts the handoff (see defer_on_prompt)
-  if [ "$(t3_defer)" = all ] && [ "$ATTEMPTS" -eq 0 ] && [ "$ACTIVE" != "true" ] && defer_arm "$SID" all "$REQ"; then
+  if [ -z "$MANUAL" ] && [ "$(t3_defer)" = all ] && [ "$ATTEMPTS" -eq 0 ] && [ "$ACTIVE" != "true" ] && defer_arm "$SID" all "$REQ"; then
     jq -nc --arg m "Handoff: context is ${CTX} tokens (limit ${THR}). Handoff due: it runs when you send your next message (T3_DEFER=all: handoff document first, then your message in a fresh session)." '{systemMessage:$m}'
     exit 0
   fi
-  emit_nudge "Handoff: context is ${CTX} tokens (limit ${THR}). Asking Claude to write the handoff document before it stops." "$REQ"
+  emit_nudge "${HEAD} Asking Claude to write the handoff document before it stops." "$REQ"
   exit 0
 fi
 

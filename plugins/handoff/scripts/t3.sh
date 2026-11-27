@@ -15,6 +15,8 @@
 #   clear <doc>            once the handoff is staged: when the thread is idle, fresh flow: send "/handoff:resume" in
 #                          a fresh session and wait for it to adopt the doc; clear flow: send "/clear", wait for the
 #                          new session (SessionStart(clear) + alias), then send "/handoff:resume".
+#                          HANDOFF_FRESH_MODEL / HANDOFF_FRESH_EFFORT (/handoff:now): `-m` / `-e` on that send.
+#   model <ref> <effort>   (/handoff:now) resolve a model / effort for the fresh session; see the mode below.
 #   alias <old sid>        (SessionStart(clear), sid = the new session) point the Claude session id T3 resumes for
 #                          this thread at the new session's transcript (see below). Local only: db + files.
 #   recover <prompt-file>  (UserPromptSubmit of a tombstoned session that T3 resumed: a /clear before 0.6 or a
@@ -139,6 +141,10 @@ if [ "$MODE" = "--bg" ]; then
   STARTED="$(date +%s)"
   deadline=$(( STARTED + SEND_TIMEOUT ))
   WHYNOT=""   # why the last send_when_idle gave up (for the outcome)
+  # /handoff:now: model / effort for the fresh session (t3.sh model output, "-" = the thread's own). T3 keeps them
+  # on the thread for later turns.
+  MSEL=(); [ -n "${HANDOFF_FRESH_MODEL:-}" ] && [ "$HANDOFF_FRESH_MODEL" != - ] && MSEL+=(-m "$HANDOFF_FRESH_MODEL")
+  [ -n "${HANDOFF_FRESH_EFFORT:-}" ] && [ "$HANDOFF_FRESH_EFFORT" != - ] && MSEL+=(-e "$HANDOFF_FRESH_EFFORT")
   PRESEND=""  # name of a check run right before each send: prints a reason when the send is no longer wanted
   BGASK=""; BGASKED=0   # fresh flow: ask the agent (once per handoff) to end background work T3 refuses a fresh session for
   BGMARK="background agents or commands"   # T3's refusal text (0.1.9 … 0.1.12)
@@ -263,7 +269,7 @@ if [ "$MODE" = "--bg" ]; then
       mkdir -p "$(dirname "$AUTO")"; echo "$LIVE" > "$AUTO"
       MARK="$HANDOFF_DIR/state/cleared/$LIVE"; rm -f "$MARK"
       BGASK=1; PRESEND=fresh_obsolete
-      send_when_idle "fresh /handoff:resume" "$Rf" --fresh; rc=$?
+      send_when_idle "fresh /handoff:resume${MSEL[*]:+ (${MSEL[*]})}" "$Rf" --fresh "${MSEL[@]}"; rc=$?
       if [ $rc -eq 2 ]; then rm -f "$AUTO"; echo "cancelled:$WHYNOT" > "$OUTCOME"; logq "handoff of $TID cancelled, nothing sent: $WHYNOT"; exit 0; fi
       if [ $rc -ne 0 ]; then
         case "$WHYNOT" in
@@ -299,7 +305,7 @@ if [ "$MODE" = "--bg" ]; then
       fi
       Rf="$HANDOFF_DIR/state/$LIVE.resume-cmd.txt"
       { printf '/handoff:resume'; [ -s "$FILE" ] && { printf ' '; cat "$FILE"; }; } > "$Rf"
-      send_when_idle "/handoff:resume" "$Rf" || fail "/handoff:resume not sent after the /clear: $WHYNOT"
+      send_when_idle "/handoff:resume${MSEL[*]:+ (${MSEL[*]})}" "$Rf" "${MSEL[@]}" || fail "/handoff:resume not sent after the /clear: $WHYNOT"
       echo "done:$NEW" > "$OUTCOME"; logq "sent /handoff:resume to $TID: handoff to session $NEW complete"; exit 0 ;;
   esac
   exit 0
@@ -307,7 +313,54 @@ fi
 
 # ---- foreground
 skip() { if [ "$MODE" = "check" ]; then say "$1"; exit 1; fi; say "$1; $MODE skipped"; exit 0; }
-case "$MODE" in check|nudge|clear|alias|recover) ;; *) say "unknown mode '$MODE'; skipped"; exit 0;; esac
+case "$MODE" in check|nudge|clear|alias|recover|model) ;; *) say "unknown mode '$MODE'; skipped"; exit 0;; esac
+
+# ---- model <ref|""> <effort|"">: (/handoff:now) resolve the model and effort the fresh session should run on, against
+# `t3ctl models` and this thread's current selection (T3CODE_THREAD_ID). Prints one line:
+#   ok <instanceId/model|-> <effort|->   send these with `threads send -m/-e` (- = keep the thread's)
+#   error: <reason>                      the user named something this thread cannot switch to (unknown model,
+#                                        another provider: the fresh session resumes through a Claude skill, effort
+#                                        the model does not offer)
+#   skip: <reason>                       cannot check (no t3ctl, server down): t3ctl validates again when it sends
+# Reads only; no T3 db, no thread resolution. Effort alone is checked against the thread's current model.
+if [ "$MODE" = model ]; then
+  WANT_M="$ARG"; WANT_E="${6:-}"
+  command -v t3ctl >/dev/null 2>&1 || { echo "skip: t3ctl not on PATH"; exit 0; }
+  CAT="$(t3json models)"
+  jq -e 'type=="array" and length>0' >/dev/null 2>&1 <<<"$CAT" || { echo "skip: t3ctl models gave no model list (is T3 Code running?)"; exit 0; }
+  CUR="null"; [ -n "$T3TID" ] && CUR="$(thread_json "$T3TID" | jq -c '.modelSelection // null' 2>/dev/null)"; [ -n "$CUR" ] || CUR="null"
+  # aliases: the user's own t3ctl ones (config.json modelAliases) first, then the catalog's (T3's). t3ctl's built-in
+  # aliases are left out: they lag behind the catalog (t3ctl 0.8.0: opus -> claude-opus-4-8, sonnet -> claude-sonnet-4-6).
+  UAL="$(jq -c '.modelAliases // {}' "${T3CTL_CONFIG_DIR:-$HOME/.config/t3ctl}/config.json" 2>/dev/null)"; [ -n "$UAL" ] || UAL="{}"
+  jq -r --arg m "$WANT_M" --arg e "$WANT_E" --argjson cur "$CUR" --argjson ual "$UAL" '
+    def norm: ascii_downcase | gsub("^\\s+|\\s+$";"") | gsub("[\\s._]+";"-") | gsub("-+";"-");
+    def names: [.model] + (if (.aliases|type)=="array" then .aliases else ((.aliases // "")|split(",")) end)
+               | map(norm) | map(select(length>0));
+    def efforts: (if (.effort|type)=="array" then .effort else ((.effort // "")|split("|")) end)
+               | map(rtrimstr("*")|gsub("^\\s+|\\s+$";"")) | map(select(length>0));
+    . as $cat | ($cur.instanceId // null) as $ci
+    | (if $m == "" then
+         {hit: ([$cat[] | select(.instanceId==$ci and .model==$cur.model)] | .[0]), keep: true}
+       else
+         (($ual | with_entries(.key |= norm))[$m|norm] // $m) as $m2
+         | (if ($m2|test("/")) then ($m2|split("/")) else [null,$m2] end) as $p0
+         | [(if $p0[0] then ($p0[0]|ascii_downcase) else null end), ($p0[1]|norm)] as $p
+         | [$cat[] | select($p[0]==null or (.instanceId|ascii_downcase)==$p[0])
+                   | select(names as $n | ($n|index($p[1])) != null or ($n|index("claude-"+$p[1])) != null)] as $hits
+         | {hit: (($hits|map(select(.instanceId==$ci))) + $hits | .[0]), keep: false}
+       end) as $res
+    | $res.hit as $h
+    | if ($res.keep|not) and $h == null then
+        "error: unknown model \"\($m)\". Models here: \([$cat[] | select($ci==null or .instanceId==$ci) | .model] | join(", "))"
+      elif ($res.keep|not) and $ci != null and $h.instanceId != $ci then
+        "error: \($h.model) runs on provider \($h.provider // $h.instanceId), this thread on \($ci): a handoff keeps the provider (the fresh session resumes through /handoff:resume)"
+      elif $e != "" and $h != null and ($h|efforts|length) > 0 and (($h|efforts)|index($e)) == null then
+        "error: effort \"\($e)\" is not offered by \($h.model) (allowed: \($h|efforts|join(", ")))"
+      else
+        "ok \(if $res.keep then "-" else "\($h.instanceId)/\($h.model)" end) \(if $e == "" then "-" else $e end)"
+      end' <<<"$CAT" 2>/dev/null || echo "skip: could not read the t3ctl model list"
+  exit 0
+fi
 [ "$AGENT" = codex ] && case "$MODE" in alias|recover) say "$MODE: Claude only; skipped"; exit 0;; esac
 case "$MODE" in nudge|clear|recover) [ -s "$ARG" ] || { say "$MODE: file '$ARG' missing or empty; skipped"; exit 0; };; esac
 [ "$MODE" = "alias" ] && [ -z "$ARG" ] && { say "alias: no pre-clear session id; skipped"; exit 0; }
@@ -492,7 +545,7 @@ case "$MODE" in
 
   clear)
     if [ "$AGENT" = codex ]; then say "handoff (document sent as a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
-    elif [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session) scheduled for thread $TID (matched by $HOW, session $SID)"
+    elif [ "$FLOW" = fresh ]; then say "handoff (/handoff:resume in a fresh session$( [ -n "${HANDOFF_FRESH_MODEL:-}${HANDOFF_FRESH_EFFORT:-}" ] && echo ", model ${HANDOFF_FRESH_MODEL:--} effort ${HANDOFF_FRESH_EFFORT:--}")) scheduled for thread $TID (matched by $HOW, session $SID)"
     else say "handoff (/clear, then /handoff:resume) scheduled for thread $TID (matched by $HOW, session $SID; $FLOWWHY)"; fi
     [ -n "$HANDOFF_T3_DRYRUN" ] && exit 0
     echo "pending" > "$HANDOFF_DIR/state/$SID.t3clear"; rm -f "$HANDOFF_DIR/state/$SID.bgask"   # a new handoff: its own ask

@@ -334,3 +334,96 @@ defer_on_prompt() {
   jq -nc --arg m "Handoff plugin: the deferred handoff could not start (${R:-no reason}); this message runs in the current context." '{systemMessage:$m}'
   return 0
 }
+
+# --- manual handoff (/handoff:now) -----------------------------------------------------------------------------------
+# The user types `/handoff:now [model] [effort] [note]` to hand off before the threshold, optionally continuing on another
+# model or effort of the same provider (T3 layer: the fresh session is sent with `threads send --fresh -m … -e …`).
+# UserPromptSubmit arms state/manual/<sid>.json (manual_arm) and gives the turn the writing request; the Stop hook treats
+# the session as past the threshold (no loop guard, no T3_DEFER) and stages the document once it was (re)written after
+# the arming, then runs the handoff (T3_AUTOCLEAR: fresh session; else the user types /clear). The note reaches the fresh
+# session as /handoff:resume arguments. Files: state/manual/<sid>.json {at, model, effort, note}, state/<sid>.manual-note.txt.
+MANUAL_DIR="$HANDOFF_DIR/state/manual"
+EFFORTS="low medium high xhigh max ultrathink"
+is_manual_prompt() { case "$1" in "/handoff:now"|"/handoff:now "*|"/handoff:now"$'\n'*|"/handoff:now"$'\t'*) return 0;; esac; return 1; }
+is_manual() { [ -f "$MANUAL_DIR/$1.json" ]; }
+manual_get() { local f="$MANUAL_DIR/$1.json"; [ -f "$f" ] && jq -r --arg k "$2" '.[$k] // empty' "$f" 2>/dev/null; return 0; }
+manual_done() { [ -f "$MANUAL_DIR/$1.json" ] && log manual "done sid=$1 (${2:-})"; rm -f "$MANUAL_DIR/$1.json"; }
+# manual_desc <sid>: " (model X, effort Y)" for messages; empty when neither was asked
+manual_desc() {
+  local m e; m="$(manual_get "$1" model)"; e="$(manual_get "$1" effort)"; m="${m#-}"; e="${e#-}"; m="${m##*/}"
+  [ -n "$m$e" ] && printf ' (%s%s%s)' "${m:+model $m}" "${m:+${e:+, }}" "${e:+effort $e}"
+  return 0
+}
+# looks_like_model <lowercase token>: a bare /handoff:now argument meant as a model (validated later where possible)
+looks_like_model() { case "$1" in */*|claude-*|opus*|sonnet*|haiku*|fable*|gpt-*|codex*) return 0;; esac; return 1; }
+# manual_parse <args>: sets MP_MODEL, MP_EFFORT, MP_NOTE. Leading tokens: -m/--model X, -e/--effort X, an effort word,
+# a model-looking token; the first other token (or `--`) starts the note, kept verbatim.
+manual_parse() {
+  local rest="$1" tok nxt lc re='^[[:space:]]*([^[:space:]]+)(.*)$'
+  MP_MODEL=""; MP_EFFORT=""; MP_NOTE=""
+  while [[ "$rest" =~ $re ]]; do
+    tok="${BASH_REMATCH[1]}"; nxt="${BASH_REMATCH[2]}"; lc="$(printf '%s' "$tok" | tr '[:upper:]' '[:lower:]')"
+    case "$tok" in
+      --) rest="$nxt"; break;;
+      -m|--model|-e|--effort)
+        [[ "$nxt" =~ $re ]] || break
+        case "$tok" in -m|--model) MP_MODEL="${BASH_REMATCH[1]}";; *) MP_EFFORT="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')";; esac
+        rest="${BASH_REMATCH[2]}"; continue;;
+      --model=*) MP_MODEL="${tok#*=}";;
+      --effort=*) MP_EFFORT="$(printf '%s' "${tok#*=}" | tr '[:upper:]' '[:lower:]')";;
+      *)
+        if [ -z "$MP_EFFORT" ] && [[ " $EFFORTS " == *" $lc "* ]]; then MP_EFFORT="$lc"
+        elif [ -z "$MP_MODEL" ] && looks_like_model "$lc"; then MP_MODEL="$tok"
+        else break; fi;;
+    esac
+    rest="$nxt"
+  done
+  MP_NOTE="$(printf '%s' "$rest" | sed -e '1s/^[[:space:]]*//' | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}')"
+  MP_NOTE="${MP_NOTE%"${MP_NOTE##*[![:space:]]}"}"
+}
+# manual_arm <sid> <prompt>: UserPromptSubmit of `/handoff:now …`. Prints the hook output: the writing request as
+# additionalContext, or a block when the handoff cannot be armed (bad model/effort, one already under way).
+manual_arm() {
+  local sid="$1" key doc R m e warn="" what req desc st
+  key="$(session_key "$sid")"; doc="$HANDOFF_DIR/sessions/$key.md"
+  manual_parse "${2#/handoff:now}"; m="$MP_MODEL"; e="$MP_EFFORT"
+  # a T3 handoff of this session already scheduled and not finished: nothing to arm
+  st="$(cat "$HANDOFF_DIR/state/$sid.t3clear" 2>/dev/null)"
+  if [ "$(state_get "$key" t3_clear)" = 1 ] && { [ "$st" = pending ] || case "$st" in pending:*) true;; *) false;; esac; }; then
+    log manual "not armed (sid=$sid): a T3 handoff is already scheduled ($st)"
+    jq -nc --arg r "Handoff plugin: a handoff of this session is already scheduled ($st); /handoff:now not run. See /handoff:status." '{decision:"block", reason:$r}'
+    return 0
+  fi
+  if [ -n "$m$e" ]; then
+    if [ "$(cfg T3_AUTOCLEAR false)" = true ] && [ -n "$T3TID" ]; then
+      R="$(bash "$T3SH" "$ROOT" "$LOG" "$sid" model "$m" "$e" 2>/dev/null | tail -n 1)"
+      case "$R" in
+        "ok "*) read -r _ m e <<<"$R";;
+        "error: "*)
+          log manual "not armed (sid=$sid): $R"
+          jq -nc --arg r "Handoff plugin: /handoff:now not run: ${R#error: }. Usage: /handoff:now [model] [effort] [note]." '{decision:"block", reason:$r}'
+          return 0;;
+        *) warn=" Model/effort not checked (${R#skip: }); T3 checks them when it starts the fresh session.";;
+      esac
+    else
+      warn=" Model/effort switching needs T3 Code with T3_AUTOCLEAR=true; after /clear pick them yourself (/model)."
+      m=""; e=""
+    fi
+  fi
+  mkdir -p "$MANUAL_DIR"; rm -f "$DEFER_DIR/$sid"   # an explicit handoff replaces a deferred one
+  state_set "$key" final_attempts 0; state_set "$key" fix_attempts 0; state_set "$key" t3_clear ""
+  rm -f "$HANDOFF_DIR/state/$sid.manual-note.txt"
+  [ -n "$MP_NOTE" ] && printf '%s\n\n%s\n' "The user wrote this note when they handed the previous context off (/handoff:now); take it into account before the document's Next steps:" "$MP_NOTE" > "$HANDOFF_DIR/state/$sid.manual-note.txt"
+  jq -nc --argjson at "$(now)" --arg m "$m" --arg e "$e" --arg n "$MP_NOTE" '{at:$at, model:$m, effort:$e, note:$n}' > "$MANUAL_DIR/$sid.json"
+  desc="$(manual_desc "$sid")"
+  log manual "armed sid=$sid$desc${MP_NOTE:+ note=${#MP_NOTE} chars}"
+  if [ -s "$doc" ]; then what="Rewrite the handoff document $doc with the Write tool (it exists from earlier: overwrite it even if it looks current) so every section reflects the current state; Standing instructions and Decisions log are append-only."
+  else what="Write the handoff document with the Write tool to $doc."; fi
+  local on="" nt=""
+  [ -n "$desc" ] && { on="${desc# (}"; on=", to continue with ${on%)}"; }
+  [ -n "$MP_NOTE" ] && nt=" The user's note for the next context (the plugin passes it on too; reflect it in Next steps): <note>${MP_NOTE}</note>."
+  req="The user asked to hand this conversation off now (/handoff:now)${on}: it continues in a fresh context that sees only the repo and a handoff document. Do not continue the task in this context.${nt} ${what} ${SECTIONS} Then stop."
+  local shown=""; [ -n "$MP_NOTE" ] && { shown="$(printf '%s' "$MP_NOTE" | tr '\n' ' ' | cut -c1-80)"; [ ${#MP_NOTE} -gt 80 ] && shown="$shown…"; shown=" Note for the next context: \"$shown\"."; }
+  jq -nc --arg m "Handoff plugin: manual handoff armed${desc}.${shown} Claude writes the handoff document in this turn, then $( [ "$(cfg T3_AUTOCLEAR false)" = true ] && echo "the thread continues in a fresh session" || echo "type /clear, then /handoff:resume").${warn}" --arg c "$req" \
+    '{systemMessage:$m, hookSpecificOutput:{hookEventName:"UserPromptSubmit", additionalContext:$c}}'
+}

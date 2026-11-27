@@ -46,8 +46,12 @@ case "$1 $2" in
   "--version ") echo "${T3_FAKE_CTL_VERSION-0.8.0}"; exit 0;;
   "projects ") echo "[{\"id\":\"P1\",\"workspaceRoot\":\"$T3_FAKE_ROOT\"}]"; exit 0;;
   "threads list") id="${4:-}"; st=idle; [ "$id" = "${T3_FAKE_MISSING:-}" ] && st=missing
-                  echo "[{\"id\":\"$id\",\"status\":\"$st\",\"title\":\"Title of $id\",\"projectId\":\"P1\",\"worktreePath\":\"${T3_FAKE_WT:-$T3_FAKE_ROOT}\"}]"; exit 0;;
+                  echo "[{\"id\":\"$id\",\"modelSelection\":{\"instanceId\":\"claudeAgent\",\"model\":\"claude-opus-5-5\"},\"status\":\"$st\",\"title\":\"Title of $id\",\"projectId\":\"P1\",\"worktreePath\":\"${T3_FAKE_WT:-$T3_FAKE_ROOT}\"}]"; exit 0;;
   "threads wait") exit 0;;
+  "models ") echo '[{"instanceId":"claudeAgent","provider":"Claude","model":"claude-opus-5-5","aliases":"opus,opus-5.5","effort":"low|medium*|high|xhigh|max"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-sonnet-5-5","aliases":"sonnet,sonnet-5.5","effort":"low|medium*|high"},
+                    {"instanceId":"claudeAgent","provider":"Claude","model":"claude-haiku-4-5","aliases":"","effort":""},
+                    {"instanceId":"codex","provider":"Codex","model":"gpt-6.2-sol","aliases":"","effort":"low|high"}]'; exit 0;;
   "threads send") [ -e "$T3_FAKE_BUSY" ] && { echo "thread is running" >&2; exit 1; }
                   case " $* " in *" --fresh "*)
                     [ -n "$T3_FAKE_FRESH_RC7" ] && { echo '{"error":{"code":"incompatible_server","message":"this T3 Code does not support fresh sessions"}}'; exit 7; }
@@ -325,6 +329,27 @@ OUT="$(hook handoff-sessionstart.sh '{"source":"resume","session_id":"SIDF"}')";
 reset_fake; echo FRS1 > "$T3_FAKE_LIVE"; full_doc "$HD/sessions/FRS1.md"; state_set FRS1 final_written_ctx 5000
 hook handoff-stop.sh "$(stop_in FRS1)" >/dev/null
 wait_for "handoff of THREADF to fresh session FRS2 complete" "$LOG" && [ "$(chain_tail SIDF)" = "FRS2" ] && ok "N: second fresh handoff, chain SIDF -> FRS1 -> FRS2" || bad "N: second" "$(grep '\[t3\]' "$LOG" | tail -3)"
+# /handoff:now from FRS2 with a model, effort and note (the fake t3ctl has no model list: armed unchecked)
+reset_fake; echo FRS2 > "$T3_FAKE_LIVE"
+OUT="$(hook handoff-userprompt.sh '{"session_id":"FRS2","prompt":"/handoff:now sonnet high then run the e2e suite"}')"
+echo "$OUT" | grep -q "manual handoff armed (model claude-sonnet-5-5, effort high)" && echo "$OUT" | grep -q "sessions/FRS2.md" && ok "N: /handoff:now armed" || bad "N: /handoff:now arm" "$OUT"
+full_doc "$HD/sessions/FRS2.md"
+OUT="$(hook handoff-stop.sh "$(stop_in FRS2)")"
+wait_for "handoff of THREADF to fresh session FRS3 complete" "$LOG" && ok "N: /handoff:now -> fresh session FRS3" || bad "N: /handoff:now flow" "$OUT $(grep '\[t3\]' "$LOG" | tail -3)"
+grep -q "threads send THREADF --fresh -m claudeAgent/claude-sonnet-5-5 -e high --stdin" "$T3_FAKE_LOG" && grep -q "then run the e2e suite" "$T3_FAKE_LOG.sent" && ok "N: fresh send carries -m/-e and the note" || bad "N: /handoff:now send" "$(cat "$T3_FAKE_LOG" "$T3_FAKE_LOG.sent")"
+
+# --- N2. /handoff:now model resolution (t3.sh model) against the fake catalog -------------------------------------------
+mres() { T3CODE_THREAD_ID=THREADF T3CTL_CONFIG_DIR="$TMP/t3cfg" bash "$SCR/t3.sh" "$TMP" "$LOG" X model "$1" "$2"; }
+mkdir -p "$TMP/t3cfg"; echo '{"modelAliases":{"quick":"claude-haiku-4-5"}}' > "$TMP/t3cfg/config.json"
+[ "$(mres sonnet "")" = "ok claudeAgent/claude-sonnet-5-5 -" ] && ok "N2: catalog alias" || bad "N2: alias" "$(mres sonnet "")"
+[ "$(mres claude_sonnet_5.5 low)" = "ok claudeAgent/claude-sonnet-5-5 low" ] && ok "N2: normalized slug (._ -> -)" || bad "N2: norm" "$(mres claude_sonnet_5.5 low)"
+[ "$(mres quick "")" = "ok claudeAgent/claude-haiku-4-5 -" ] && ok "N2: user t3ctl alias" || bad "N2: user alias" "$(mres quick "")"
+[ "$(mres "" max)" = "ok - max" ] && ok "N2: effort only, checked against the thread's model" || bad "N2: effort only" "$(mres "" max)"
+mres "" ultra | grep -q '^error: effort "ultra" is not offered by claude-opus-5-5' && ok "N2: bad effort for the thread's model" || bad "N2: bad effort" "$(mres "" ultra)"
+mres sonnet max | grep -q '^error: effort "max" is not offered by claude-sonnet-5-5' && ok "N2: bad effort for the new model" || bad "N2: bad effort new" "$(mres sonnet max)"
+mres gpt-6.2-sol "" | grep -q "^error: gpt-6.2-sol runs on provider Codex" && ok "N2: other provider refused" || bad "N2: provider" "$(mres gpt-6.2-sol "")"
+mres nope "" | grep -q '^error: unknown model "nope"' && ok "N2: unknown model" || bad "N2: unknown" "$(mres nope "")"
+[ "$(mres claude-haiku-4-5 xhigh)" = "ok claudeAgent/claude-haiku-4-5 xhigh" ] && ok "N2: model without an effort list: effort left to T3" || bad "N2: no list" "$(mres claude-haiku-4-5 xhigh)"
 
 # --- O. fresh send refused while background work runs: retried, then named ---------------------------------------
 v2row THREADG SIDG; export T3CODE_THREAD_ID=THREADG

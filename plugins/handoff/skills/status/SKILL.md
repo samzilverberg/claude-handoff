@@ -12,9 +12,11 @@ Handoff dir: !`ls -la "${CLAUDE_PROJECT_DIR}/.claude/handoff" "${CLAUDE_PROJECT_
 
 T3 thread of this session (handoffs staged for its next fresh session live in by-thread/): !`echo "${T3CODE_THREAD_ID:-none (not under T3 Code)}"`
 
+Manual handoffs armed (/handoff:now, waiting for the end of the turn): !`cat "${CLAUDE_PROJECT_DIR}/.claude/handoff/state/manual/"*.json 2>/dev/null || echo none`
+
 Owner of current.md: !`cat "${CLAUDE_PROJECT_DIR}/.claude/handoff/current.owner" 2>/dev/null || echo none` (this Claude pid: !`ps -o ppid= -p $PPID | tr -d ' '`)
 
 Last hook log lines:
 !`tail -n 15 "${CLAUDE_PROJECT_DIR}/.claude/handoff/hooks.log" 2>/dev/null || echo "(no log yet)"`
 
-Summarize the above for the user in a few lines: is a handoff staged, whose is it, when was it written, what is the threshold, whether live state is on, and (when T3_AUTOCLEAR is true) whether the T3 layer preflight is ok or what blocks it, and which handoff flow it uses (fresh session, or /clear + alias and why).
+Summarize the above for the user in a few lines: is a handoff staged, whose is it, when was it written, what is the threshold, whether live state is on, and (when T3_AUTOCLEAR is true) whether the T3 layer preflight is ok or what blocks it, and which handoff flow it uses (fresh session, or /clear + alias and why), and whether a /handoff:now is armed (model, effort, note).

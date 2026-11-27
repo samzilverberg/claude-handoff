@@ -1,5 +1,5 @@
 #!/bin/bash
-# UserPromptSubmit. T3_DEFER (see defer_on_prompt in handoff-lib.sh): holds the message when a deferred handoff is
+# UserPromptSubmit. /handoff:now: arms a manual handoff (manual_arm in handoff-lib.sh). T3_DEFER (see defer_on_prompt in handoff-lib.sh): holds the message when a deferred handoff is
 # armed. Otherwise a fast no-op unless this session is tombstoned (/cleared and superseded). A tombstoned session
 # that gets a prompt under T3 Code is a thread T3 resumed on its stale pre-/clear session (a /clear by plugin <= 0.5,
 # or one whose alias failed). With T3_AUTOCLEAR the prompt must not run in that stale context (a resumed 300k+
@@ -16,8 +16,15 @@ IN="$(cat)"
 SID="$(jq -r .session_id <<<"$IN")"
 # runs on every prompt: answer the common case (live session, nothing held) before loading the library
 ST="${CLAUDE_PROJECT_DIR:-$PWD}/.claude/handoff/state"
-[ -f "$ST/tombstones/$SID.json" ] || [ -f "$ST/defer/$SID" ] || [ -f "$ST/$SID.held" ] || exit 0
+MAN=""; grep -qE '"prompt" *: *"/handoff:now([ \\"]|$)' <<<"$IN" && MAN=1
+[ -n "$MAN" ] || [ -f "$ST/tombstones/$SID.json" ] || [ -f "$ST/defer/$SID" ] || [ -f "$ST/$SID.held" ] || exit 0
 source "$(dirname "$0")/handoff-lib.sh"
+# /handoff:now (manual handoff, see manual_arm): arm it and give this turn the writing request. A tombstoned session
+# falls through to the handling below (it is not the thread's live session).
+if [ -n "$MAN" ] && [ ! -f "$ST/tombstones/$SID.json" ]; then
+  P="$(jq -r '.prompt // empty' <<<"$IN")"
+  if is_manual_prompt "$P"; then rm -f "$ST/$SID.held"; manual_arm "$SID" "$P"; exit 0; fi
+fi
 # T3_DEFER: a handoff (or its fresh session) armed for this session's next message: hold the message, start it
 defer_on_prompt "$SID" "$(jq -r '.prompt // empty' <<<"$IN")" "$HANDOFF_DIR/sessions/$(session_key "$SID").md" "$(session_key "$SID")" && exit 0
 [ -f "$ST/tombstones/$SID.json" ] || exit 0

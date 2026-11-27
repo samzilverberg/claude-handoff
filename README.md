@@ -6,6 +6,9 @@ that crosses a context threshold: Claude writes a structured handoff document it
 (`T3_AUTOCLEAR`) does it for you, in the same thread: on T3 Code >= 0.1.9 it sends `/handoff:resume` as a fresh session (T3's own `/clear`), on older T3 it types `/clear` + `/handoff:resume` and keeps T3 pointed at the live session. Running `/handoff:resume` without `/clear` just adds the document on top of the full context. Auto-compact stays on only as a safeguard far above the
 threshold. Verified against Claude Code 2.1.263 with 18 driven test sessions plus real long sessions.
 
+**Manual handoff** (since 0.11): `/handoff:now [model] [effort] [note]` hands off right away, below the threshold;
+under T3 Code it can continue the same thread on another model or effort. See [Manual handoff](#manual-handoff-handoffnow).
+
 **OpenAI Codex** is supported too (since 0.8, same plugin dir, separate hooks): Codex writes the same document at the
 threshold, and under T3 Code the thread continues from it in a fresh Codex session automatically. See
 [Codex](#codex-openai).
@@ -371,6 +374,56 @@ T3_AUTOCLEAR=true
 Codex auto-compacts at about 90% of the model window (seen at 434k of 475k); the 70% cap keeps the handoff ahead of it.
 `model_auto_compact_token_limit` in `~/.codex/config.toml` moves Codex's own limit if needed.
 
+## Manual handoff (`/handoff:now`)
+
+Two cases the threshold does not cover: you want to hand off early (a natural break, a long context that is still
+under the limit), or you want the rest of the work to run on another model or effort in the same T3 thread (e.g.
+Opus/high for the design, Sonnet/medium for the mechanical part) without dragging the whole context along.
+
+```
+/handoff:now                                  hand off now, same model and effort
+/handoff:now sonnet                           continue on Sonnet (T3 Code + T3_AUTOCLEAR)
+/handoff:now opus max                         model and effort
+/handoff:now low then run the e2e suite       effort only, plus a note for the next context
+/handoff:now -m claudeAgent/claude-fable-5-2 -e high -- high-risk part next   explicit flags; `--` starts the note
+```
+
+Arguments: leading tokens are read as an effort (`low` `medium` `high` `xhigh` `max` `ultrathink`), a model (`opus`,
+`sonnet`, `haiku`, `fable`, `claude-…`, `<instance>/<model>`) or the flags `-m/--model`, `-e/--effort`; the first other
+word, or `--`, starts the note, kept verbatim. Models resolve against `t3ctl models` (T3's catalog): your own aliases in
+`~/.config/t3ctl/config.json` (`modelAliases`) first, then the catalog's aliases (`opus` → the newest Opus T3 offers),
+with `.`/`_` read as `-`. t3ctl's built-in aliases are not used: they lag behind the catalog (t3ctl 0.8.0 maps `opus` to
+`claude-opus-4-8`, `sonnet` to `claude-sonnet-4-6`). The resolved `<instance>/<model>` is what gets sent. A user alias
+that does not look like a model name needs `-m` (`/handoff:now -m quick`).
+
+What happens:
+
+1. `UserPromptSubmit` sees `/handoff:now`, arms `state/manual/<sid>.json` and gives this turn the writing request
+   (document path + sections) as context. With a model or effort under the T3 layer it first checks them with
+   `t3ctl models` against the thread's current provider: an unknown model, a model of another provider (the fresh
+   session resumes through `/handoff:resume`, a Claude skill) or an effort the model does not offer blocks the
+   message (zero tokens, the reason is shown). When the list cannot be read, the values go through unchecked and T3
+   checks them at the send. A deferred handoff (`T3_DEFER`) armed for the session is replaced.
+2. Claude writes the document in that turn (`/handoff:now` is a skill that tells it to follow the note and stop).
+3. The `Stop` hook treats the session as past the threshold, whatever its size: no loop guard, no deferral. A document
+   older than the arming does not count (an earlier running copy must be rewritten); otherwise the usual rules hold:
+   missing sections asked for (max 2), document checks, staging.
+4. T3 layer: `/handoff:resume` goes to the thread in a fresh session with `threads send --fresh -m <model> -e <effort>`
+   (older T3: the `/clear` flow, with `-m/-e` on the `/handoff:resume` send), the note as its arguments. T3 keeps the
+   model and effort on the thread for later turns. Without the T3 layer: `Type /clear, then /handoff:resume`; a model
+   or effort is dropped with a warning (pick them with `/model` after the `/clear`).
+
+Refused while a T3 handoff of the session is already scheduled and pending. Claude only for now (Codex: no
+`/handoff:now`). Tests: `tests/manual_test.sh`, plus `tests/t3_test.sh` (N: fresh session with `-m/-e` and the note;
+N2: model resolution).
+
+Verified live (2026-11-27, T3 Code 0.1.12, Claude Code 2.1.332, t3ctl 0.8.0): a thread on Opus/high got
+`/handoff:now sonnet low then append …`; `UserPromptSubmit` received the raw `/handoff:now …` text and its
+`additionalContext` reached the skill's turn (document written in that turn, staged at its Stop, no extra request); the
+fresh session ran on `claude-sonnet-5-5` (transcript `message.model`), handled the note, and T3 recorded
+`claude-sonnet-5-5`/`low` for the thread: a later plain message (no `-m/-e`) ran on Sonnet/low too (T3 runs table). A
+`/handoff:now gpt-6.2-sol` was blocked before any turn (another provider).
+
 ## Deferred handoff (`T3_DEFER`, experimental)
 
 By default the T3 handoff runs right after the turn that crosses the threshold, so the reply you want to read is
@@ -469,6 +522,11 @@ bug) is also out of scope. Tests: `plugins/handoff/tests/tombstone_test.sh`.
 * Seen on Claude Code 2.1.327 under T3 Code 0.1.10: a `/clear` with no fresh handoff doc (so `SessionEnd(clear)` starts the nested summarizer) had its `SessionEnd` hook killed within ~1 s, so no doc is written; the "Claude Code waits for SessionEnd(clear)" fact above (run7) no longer holds there. The automatic paths always have the doc ready (instant), so this affects only a manual `/clear` without a handoff. Since 0.7.2 the hook writes the tombstone and the `pid-cleared` bridge before the summarizer, so the `/clear` chain stays linked (verified live); 0.7.1 and earlier lost both.
 * Wakes of a replaced session: on T3 0.1.12 a fresh handoff normally ends the old process (T3 refuses the fresh session while it runs background work), so the wake case of 0.10.1 is verified by a replay of thread 569772de (`tests/wake_test.sh`) and by the real hook against the live 0.1.12 db, not by a live wake. T3's refusal checks only the session of its active pointer; if a replaced, still-alive process holds the pointer, the fresh session waits for that process's background work, and the plugin can only say so (pending note), not stop it.
 * The routing query reads T3's runs/messages/threads tables (layout of 0.1.11–0.1.12). Without them (older T3) it falls back to the newest run ordinal, then `updated_at`.
+* t3ctl auth drift (seen 2026-11-27): `~/.config/t3ctl/config.json` listed `orchestration:operate` while the server's
+  session (`t3ctl auth status`) granted only `orchestration:read`, so t3ctl did not upgrade and every write (`threads
+  send`, so every automatic handoff and nudge) was refused with "missing required scope: orchestration:operate". Fix:
+  `t3ctl auth pair --operate`. The helper treats the refusal like a busy thread: it retries until `T3_SEND_TIMEOUT`
+  (600 s), logging each refusal, then records the handoff as failed (type /clear, then /handoff:resume).
 * `t3ctl` JSON output can contain raw control characters that break `jq`; the helper strips them. When scripting `t3ctl threads new`, never pass an empty thread ref to `threads send`: it resolves to some other thread.
 
 ## License
